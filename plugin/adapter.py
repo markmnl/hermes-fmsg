@@ -1,0 +1,799 @@
+"""fmsg platform adapter (Hermes plugin).
+
+Connects Hermes Agent to an fmsg host through fmsg-webapi: real-time
+inbound over the ``/fmsg/ws`` WebSocket, outbound via the JSON REST
+routes. Auth is an fmsg API key (``fmsgk_...``) exchanged for a
+short-lived JWT — run the agent as a derived sub-account such as
+``@alice_hermes@example.com``.
+
+Configuration in config.yaml::
+
+    platforms:
+      fmsg:
+        enabled: true
+        extra:
+          api_url: "https://fmsgapi.example.com"
+          api_key: "fmsgk_..."
+          default_topic: "Hermes"
+
+Environment variables (env wins over config.yaml ``extra``; names match
+fmsg-cli so one .env can drive both):
+
+    FMSG_API_URL            Base URL of fmsg-webapi (required)
+    FMSG_API_KEY            API key fmsgk_<key_id>_<secret> (required)
+    FMSG_ALLOWED_USERS      Comma-separated @user@domain allowlist
+    FMSG_ALLOW_ALL_USERS    Allow any sender — dev only
+    FMSG_HOME_CHANNEL       @user@domain for cron / notification delivery
+    FMSG_HOME_CHANNEL_NAME  Human label for the home channel
+    FMSG_DEFAULT_TOPIC      Topic for agent-initiated root messages
+                            (default "Hermes")
+
+Identity/threading model: the counterparty fmsg address is both
+``chat_id`` and ``user_id`` (fmsg addresses are authenticated by the
+host, so the allowlist is a real trust boundary). An fmsg thread — a
+root message carrying ``topic`` plus replies chaining ``pid`` — maps to
+a Hermes session via ``thread_id`` = root message id, so each thread
+keeps its own conversation context.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import random
+import time
+import mimetypes
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import httpx  # noqa: F401  (fmsg_client needs it)
+    HTTPX_AVAILABLE = True
+except ImportError:
+    HTTPX_AVAILABLE = False
+
+try:
+    import websockets  # noqa: F401
+    WEBSOCKETS_AVAILABLE = True
+except ImportError:
+    WEBSOCKETS_AVAILABLE = False
+
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    cache_media_bytes,
+    get_inbound_media_max_bytes,
+)
+
+try:
+    from .fmsg_client import (
+        FmsgApiError,
+        FmsgAuthError,
+        FmsgClient,
+        TokenManager,
+        TOKEN_REFRESH_BEFORE,
+    )
+except ImportError:  # loaded outside a package context
+    import importlib.util as _ilu
+
+    _spec = _ilu.spec_from_file_location(
+        "hermes_fmsg_client", Path(__file__).parent / "fmsg_client.py"
+    )
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    FmsgApiError = _mod.FmsgApiError
+    FmsgAuthError = _mod.FmsgAuthError
+    FmsgClient = _mod.FmsgClient
+    TokenManager = _mod.TokenManager
+    TOKEN_REFRESH_BEFORE = _mod.TOKEN_REFRESH_BEFORE
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_TOPIC = "Hermes"
+# Well under the webapi's 10 MB body cap; keeps single messages readable.
+MAX_MESSAGE_LENGTH = 65536
+MAX_ATTACH_BYTES = 10 * 1024 * 1024  # FMSG_API_MAX_ATTACH_SIZE default
+DEDUP_MAX_SIZE = 1000
+RECONNECT_BACKOFF_MAX = 60.0
+CATCHUP_PAGE_LIMIT = 100
+FIRST_RUN_CATCHUP_MAX = 50  # unread backlog cap on a brand-new install
+
+_KIND_TO_MESSAGE_TYPE = {
+    "image": MessageType.PHOTO,
+    "video": MessageType.VIDEO,
+    "audio": MessageType.AUDIO,
+    "document": MessageType.DOCUMENT,
+}
+
+
+def _extra_or_env(extra: Dict[str, Any], key: str, env: str, default: str = "") -> str:
+    return str(extra.get(key) or os.getenv(env, default) or default).strip()
+
+
+def check_requirements() -> bool:
+    """Installable and minimally configured (deps + required env)."""
+    if not (HTTPX_AVAILABLE and WEBSOCKETS_AVAILABLE):
+        return False
+    return bool(os.getenv("FMSG_API_URL", "").strip() and os.getenv("FMSG_API_KEY", "").strip())
+
+
+def validate_config(config) -> bool:
+    extra = getattr(config, "extra", {}) or {}
+    api_url = extra.get("api_url") or os.getenv("FMSG_API_URL", "")
+    api_key = extra.get("api_key") or os.getenv("FMSG_API_KEY", "")
+    return bool(api_url and api_key)
+
+
+def is_connected(config) -> bool:
+    return validate_config(config)
+
+
+class FmsgAdapter(BasePlatformAdapter):
+    """fmsg adapter: WebSocket inbound, REST outbound via fmsg-webapi."""
+
+    MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
+    supports_code_blocks = True  # bodies are plain text; fences pass through
+
+    def __init__(self, config: PlatformConfig):
+        super().__init__(config=config, platform=Platform("fmsg"))
+
+        extra = config.extra or {}
+        self._api_url = _extra_or_env(extra, "api_url", "FMSG_API_URL").rstrip("/")
+        self._api_key = _extra_or_env(extra, "api_key", "FMSG_API_KEY")
+        self._default_topic = (
+            _extra_or_env(extra, "default_topic", "FMSG_DEFAULT_TOPIC") or DEFAULT_TOPIC
+        )
+
+        self._tokens: Optional[TokenManager] = None
+        self._client: Optional[FmsgClient] = None
+        self._ws_task: Optional[asyncio.Task] = None
+
+        # Dedup: message id -> monotonic-ish timestamp, insertion-ordered.
+        self._seen_ids: Dict[int, float] = {}
+        # message id -> (root id, root topic) for pid-chain resolution.
+        self._thread_roots: Dict[int, Tuple[int, Optional[str]]] = {}
+        # (chat_id, thread_id) -> last inbound message id, for reply threading.
+        self._last_inbound: Dict[Tuple[str, str], int] = {}
+        self._last_seen_id: int = 0
+        self._state_path = Path(
+            os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))
+        ) / "fmsg_last_seen.json"
+
+    # -- Connection lifecycle -------------------------------------------------
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        if not (HTTPX_AVAILABLE and WEBSOCKETS_AVAILABLE):
+            logger.warning(
+                "[%s] missing deps. Run: pip install httpx websockets", self.name
+            )
+            return False
+        if not (self._api_url and self._api_key):
+            logger.warning("[%s] FMSG_API_URL / FMSG_API_KEY not configured", self.name)
+            return False
+
+        self._tokens = TokenManager(self._api_url, self._api_key)
+        self._client = FmsgClient(self._tokens)
+        self._load_state()
+        self._ws_task = asyncio.create_task(self._run_ws())
+        self._mark_connected()
+        logger.info("[%s] Connected — streaming from %s/fmsg/ws", self.name, self._api_url)
+        return True
+
+    async def disconnect(self) -> None:
+        self._running = False
+        self._mark_disconnected()
+        if self._ws_task:
+            self._ws_task.cancel()
+            try:
+                await self._ws_task
+            except asyncio.CancelledError:
+                pass
+            self._ws_task = None
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+            self._tokens = None
+        logger.info("[%s] Disconnected", self.name)
+
+    # -- Inbound: WebSocket loop ------------------------------------------------
+
+    async def _run_ws(self) -> None:
+        backoff = 1.0
+        while self._running:
+            stream_start = time.monotonic()
+            try:
+                # Fresh token up front; FmsgAuthError here is fatal (bad key).
+                await self._tokens.get_token()
+                self._own_address()  # cache identity for self-filtering
+                await self._catch_up()
+                await self._consume_ws()
+            except asyncio.CancelledError:
+                return
+            except FmsgAuthError as e:
+                logger.error("[%s] API key rejected: %s", self.name, e)
+                self._set_fatal_error(
+                    "fmsg_unauthorized",
+                    f"fmsg-webapi rejected the API key: {e}. Check FMSG_API_KEY.",
+                    retryable=False,
+                )
+                return
+            except Exception as e:
+                if not self._running:
+                    return
+                logger.warning("[%s] Stream error: %s", self.name, e)
+
+            if not self._running:
+                return
+            # Reset backoff after a healthy long-lived connection.
+            if time.monotonic() - stream_start >= 60.0:
+                backoff = 1.0
+            delay = backoff * (0.5 + random.random())
+            logger.info("[%s] Reconnecting in %.1fs...", self.name, delay)
+            await asyncio.sleep(delay)
+            backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX)
+
+    async def _consume_ws(self) -> None:
+        """Consume WS events until the token nears expiry, then return to
+        reconnect with a fresh token (the handshake JWT is not renewable
+        in-band)."""
+        deadline = None
+        if self._tokens.expires_at is not None:
+            remaining = (
+                self._tokens.expires_at - datetime.now(timezone.utc)
+            ).total_seconds() - 2 * TOKEN_REFRESH_BEFORE.total_seconds()
+            deadline = time.monotonic() + max(remaining, 60.0)
+
+        agen = self._client.iter_events()
+        try:
+            while self._running:
+                timeout = None
+                if deadline is not None:
+                    timeout = deadline - time.monotonic()
+                    if timeout <= 0:
+                        logger.info("[%s] Token nearing expiry — rotating connection", self.name)
+                        return
+                try:
+                    event = await asyncio.wait_for(agen.__anext__(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    logger.info("[%s] Token nearing expiry — rotating connection", self.name)
+                    return
+                except StopAsyncIteration:
+                    return
+                if event.get("type") == "new_msg" and isinstance(event.get("data"), dict):
+                    await self._on_message(event["data"])
+                # Unknown event types are ignored (forward compatible).
+        finally:
+            await agen.aclose()
+
+    async def _catch_up(self) -> None:
+        """Dispatch messages that arrived while disconnected.
+
+        Pages the inbox (id-descending) until we pass ``_last_seen_id``. On a
+        brand-new install (no persisted state) only unread messages are
+        dispatched, capped so an old mailbox doesn't flood the agent.
+        """
+        first_run = self._last_seen_id == 0
+        pending: List[Dict[str, Any]] = []
+        offset = 0
+        while True:
+            page = await self._client.list_messages(limit=CATCHUP_PAGE_LIMIT, offset=offset)
+            if not page:
+                break
+            for msg in page:
+                msg_id = msg.get("id") or 0
+                if not first_run and msg_id <= self._last_seen_id:
+                    page = None
+                    break
+                if first_run and (msg.get("read") or len(pending) >= FIRST_RUN_CATCHUP_MAX):
+                    page = None
+                    break
+                pending.append(msg)
+            if page is None or len(page) < CATCHUP_PAGE_LIMIT:
+                break
+            offset += CATCHUP_PAGE_LIMIT
+        if first_run and self._last_seen_id == 0 and not pending:
+            # Nothing to deliver but anchor the high-water mark so future
+            # restarts don't rescan history.
+            head = await self._client.list_messages(limit=1)
+            if head:
+                self._record_seen(head[0].get("id") or 0)
+        for msg in reversed(pending):  # oldest first
+            await self._on_message(msg)
+
+    # -- Inbound: message processing ---------------------------------------------
+
+    async def _on_message(self, msg: Dict[str, Any]) -> None:
+        msg_id = msg.get("id")
+        if msg_id is None or self._is_duplicate(msg_id):
+            return
+        sender = msg.get("from") or ""
+        if sender == self._own_address():
+            self._record_seen(msg_id)
+            return
+
+        try:
+            text = await self._message_text(msg_id, msg)
+            media_urls, media_types, msg_type = await self._cache_attachments(msg_id, msg)
+        except FmsgApiError as e:
+            logger.warning("[%s] Failed to fetch message %s content: %s", self.name, msg_id, e)
+            return
+
+        root_id, topic = await self._resolve_thread_root(msg_id, msg)
+        pid = msg.get("pid") if msg.get("has_pid") or msg.get("pid") else None
+
+        source = self.build_source(
+            chat_id=sender,
+            chat_name=sender.lstrip("@").split("@")[0],
+            chat_type="dm",
+            user_id=sender,
+            user_name=sender.lstrip("@").split("@")[0],
+            thread_id=str(root_id),
+            chat_topic=topic,
+            message_id=str(msg_id),
+        )
+
+        metadata: Dict[str, Any] = {}
+        context_notes: List[str] = []
+        if msg.get("important"):
+            metadata["important"] = True
+            context_notes.append("[the sender marked this fmsg message as important]")
+        if msg.get("no_reply"):
+            metadata["no_reply"] = True
+            context_notes.append(
+                "[the sender flagged no_reply: replies to this fmsg thread will be discarded]"
+            )
+
+        ts = msg.get("time")
+        try:
+            timestamp = (
+                datetime.fromtimestamp(float(ts), tz=timezone.utc)
+                if ts
+                else datetime.now(tz=timezone.utc)
+            )
+        except (ValueError, OSError, TypeError):
+            timestamp = datetime.now(tz=timezone.utc)
+
+        event = MessageEvent(
+            text=text,
+            message_type=msg_type,
+            source=source,
+            message_id=str(msg_id),
+            raw_message=msg,
+            media_urls=media_urls,
+            media_types=media_types,
+            reply_to_message_id=str(pid) if pid else None,
+            channel_context="\n".join(context_notes) or None,
+            metadata=metadata,
+            timestamp=timestamp,
+        )
+
+        self._last_inbound[(sender, str(root_id))] = msg_id
+        logger.debug("[%s] Message %s from %s: %s", self.name, msg_id, sender, text[:80])
+        await self.handle_message(event)
+        self._record_seen(msg_id)
+        try:
+            await self._client.mark_read(msg_id)
+        except FmsgApiError as e:
+            logger.debug("[%s] mark_read(%s) failed: %s", self.name, msg_id, e)
+
+    async def _message_text(self, msg_id: int, msg: Dict[str, Any]) -> str:
+        """Body text: short_text when it holds the complete body, else /data."""
+        mime = (msg.get("type") or "").lower()
+        short = msg.get("short_text")
+        size = msg.get("size") or 0
+        if short is not None and len(short.encode("utf-8")) >= size:
+            return short
+        if not mime.startswith("text/"):
+            return short or ""
+        data = await self._client.get_data(msg_id)
+        return data.decode("utf-8", errors="replace")
+
+    async def _cache_attachments(
+        self, msg_id: int, msg: Dict[str, Any]
+    ) -> Tuple[List[str], List[str], MessageType]:
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        msg_type = MessageType.TEXT
+        max_bytes = get_inbound_media_max_bytes()
+        for att in msg.get("attachments") or []:
+            filename = att.get("filename") or "attachment.bin"
+            size = att.get("size") or 0
+            if max_bytes and size > max_bytes:
+                logger.warning(
+                    "[%s] Skipping oversized attachment %s (%d bytes) on message %s",
+                    self.name, filename, size, msg_id,
+                )
+                continue
+            try:
+                data = await self._client.get_attachment(msg_id, filename)
+            except FmsgApiError as e:
+                logger.warning(
+                    "[%s] Failed to download attachment %s of %s: %s",
+                    self.name, filename, msg_id, e,
+                )
+                continue
+            mime = mimetypes.guess_type(filename)[0] or ""
+            cached = cache_media_bytes(data, filename=filename, mime_type=mime)
+            if cached is None:
+                continue
+            media_urls.append(cached.path)
+            media_types.append(cached.media_type)
+            if msg_type is MessageType.TEXT:
+                msg_type = _KIND_TO_MESSAGE_TYPE.get(cached.kind, MessageType.DOCUMENT)
+        return media_urls, media_types, msg_type
+
+    async def _resolve_thread_root(
+        self, msg_id: int, msg: Dict[str, Any]
+    ) -> Tuple[int, Optional[str]]:
+        """Walk the pid chain to the thread root; cache every hop."""
+        if msg_id in self._thread_roots:
+            return self._thread_roots[msg_id]
+        pid = msg.get("pid") if msg.get("has_pid") or msg.get("pid") else None
+        if not pid:
+            root = (msg_id, msg.get("topic"))
+            self._thread_roots[msg_id] = root
+            return root
+        chain = [msg_id]
+        current = pid
+        root: Tuple[int, Optional[str]]
+        while True:
+            if current in self._thread_roots:
+                root = self._thread_roots[current]
+                break
+            try:
+                parent = await self._client.get_message(current)
+            except FmsgApiError as e:
+                # Root unreachable (e.g. pruned) — treat the earliest
+                # reachable ancestor as the root so threading still works.
+                logger.debug("[%s] pid walk stopped at %s: %s", self.name, current, e)
+                root = (current, None)
+                break
+            ppid = parent.get("pid") if parent.get("has_pid") or parent.get("pid") else None
+            if not ppid:
+                root = (current, parent.get("topic"))
+                break
+            chain.append(current)
+            current = ppid
+        for mid in chain:
+            self._thread_roots[mid] = root
+        self._thread_roots[current] = root
+        return root
+
+    # -- Dedup + persistence ---------------------------------------------------
+
+    def _is_duplicate(self, msg_id: int) -> bool:
+        if len(self._seen_ids) > DEDUP_MAX_SIZE:
+            for key in list(self._seen_ids)[: DEDUP_MAX_SIZE // 2]:
+                self._seen_ids.pop(key, None)
+        if msg_id in self._seen_ids:
+            return True
+        self._seen_ids[msg_id] = time.time()
+        return False
+
+    def _record_seen(self, msg_id: int) -> None:
+        if msg_id > self._last_seen_id:
+            self._last_seen_id = msg_id
+            self._save_state()
+
+    def _load_state(self) -> None:
+        try:
+            state = json.loads(self._state_path.read_text())
+            self._last_seen_id = int(state.get("last_seen_id", 0))
+        except (OSError, ValueError, json.JSONDecodeError):
+            self._last_seen_id = 0
+
+    def _save_state(self) -> None:
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._state_path.write_text(json.dumps({"last_seen_id": self._last_seen_id}))
+        except OSError as e:
+            logger.debug("[%s] Could not persist last_seen state: %s", self.name, e)
+
+    # -- Outbound -----------------------------------------------------------------
+
+    def _own_address(self) -> str:
+        return (self._tokens and self._tokens.address) or ""
+
+    def _resolve_reply_target(
+        self, chat_id: str, reply_to: Optional[str], metadata: Optional[Dict[str, Any]]
+    ) -> Tuple[Optional[int], Optional[str]]:
+        """Return (pid, topic) for an outbound message — exactly one is set."""
+        metadata = metadata or {}
+        if reply_to:
+            try:
+                return int(reply_to), None
+            except (TypeError, ValueError):
+                pass
+        thread_id = metadata.get("thread_id")
+        if thread_id is not None:
+            last = self._last_inbound.get((chat_id, str(thread_id)))
+            if last:
+                return last, None
+            try:
+                return int(thread_id), None  # reply to the thread root
+            except (TypeError, ValueError):
+                pass
+        return None, self._default_topic
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        return await self._send_message(chat_id, content, reply_to=reply_to, metadata=metadata)
+
+    async def _send_message(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        attachments: Optional[List[Tuple[str, bytes]]] = None,
+    ) -> SendResult:
+        if not self._client:
+            return SendResult(success=False, error="fmsg client not initialized")
+        from_addr = self._own_address()
+        if not from_addr:
+            try:
+                await self._tokens.get_token()
+                from_addr = self._own_address()
+            except (FmsgAuthError, FmsgApiError) as e:
+                return SendResult(success=False, error=str(e))
+
+        if len(content) > self.MAX_MESSAGE_LENGTH:
+            logger.warning(
+                "[%s] Message truncated from %d to %d chars",
+                self.name, len(content), self.MAX_MESSAGE_LENGTH,
+            )
+            content = content[: self.MAX_MESSAGE_LENGTH]
+
+        pid, topic = self._resolve_reply_target(chat_id, reply_to, metadata)
+        draft_id: Optional[int] = None
+        try:
+            draft_id = await self._client.create_draft(
+                from_addr, [chat_id], content, pid=pid, topic=topic
+            )
+            for filename, data in attachments or []:
+                await self._client.attach(draft_id, filename, data)
+            await self._client.send(draft_id)
+            return SendResult(success=True, message_id=str(draft_id))
+        except FmsgAuthError as e:
+            return SendResult(success=False, error=str(e))
+        except FmsgApiError as e:
+            if draft_id is not None:
+                try:
+                    await self._client.delete_draft(draft_id)
+                except FmsgApiError:
+                    pass
+            # 400 on a reply can mean the pid was bad — a retry won't help;
+            # 5xx and network-level errors are worth retrying.
+            return SendResult(success=False, error=str(e), retryable=e.status_code >= 500)
+        except Exception as e:
+            logger.error("[%s] Send error: %s", self.name, e)
+            return SendResult(success=False, error=str(e), retryable=True)
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """fmsg has no typing indicator."""
+
+    async def _send_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str],
+        file_name: Optional[str],
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> SendResult:
+        path = Path(file_path)
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            return SendResult(success=False, error=f"cannot read {file_path}: {e}")
+        if len(data) > MAX_ATTACH_BYTES:
+            return SendResult(
+                success=False,
+                error=f"attachment {path.name} exceeds fmsg {MAX_ATTACH_BYTES // (1024*1024)} MB limit",
+                error_kind="too_long",
+            )
+        return await self._send_message(
+            chat_id,
+            caption or "",
+            reply_to=reply_to,
+            metadata=metadata,
+            attachments=[(file_name or path.name, data)],
+        )
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        # image_url may be a remote URL (generated images) or a local path.
+        if image_url.startswith(("http://", "https://")):
+            try:
+                async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
+                    resp = await client.get(image_url)
+                    resp.raise_for_status()
+                    data = resp.content
+            except Exception as e:
+                return SendResult(success=False, error=f"failed to fetch image: {e}")
+            name = image_url.split("/")[-1].split("?")[0] or "image.jpg"
+            if "." not in name:
+                name += ".jpg"
+            if len(data) > MAX_ATTACH_BYTES:
+                return SendResult(success=False, error="image exceeds fmsg attachment limit", error_kind="too_long")
+            return await self._send_message(
+                chat_id, caption or "", reply_to=reply_to, metadata=metadata,
+                attachments=[(name, data)],
+            )
+        return await self._send_file(chat_id, image_url, caption, None, reply_to, metadata)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_file(chat_id, file_path, caption, file_name, reply_to, metadata)
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_file(chat_id, audio_path, caption, None, reply_to, metadata)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        return await self._send_file(chat_id, video_path, caption, None, reply_to, metadata)
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        return {
+            "id": chat_id,
+            "name": chat_id.lstrip("@").split("@")[0],
+            "type": "dm",
+            "platform": "fmsg",
+        }
+
+
+# ---------------------------------------------------------------------------
+# Plugin registration
+# ---------------------------------------------------------------------------
+
+
+def _env_enablement() -> Optional[dict]:
+    """Seed PlatformConfig.extra from env so env-only setups auto-enable."""
+    api_url = os.getenv("FMSG_API_URL", "").strip()
+    api_key = os.getenv("FMSG_API_KEY", "").strip()
+    if not (api_url and api_key):
+        return None
+    seed: dict = {"api_url": api_url.rstrip("/"), "api_key": api_key}
+    default_topic = os.getenv("FMSG_DEFAULT_TOPIC", "").strip()
+    if default_topic:
+        seed["default_topic"] = default_topic
+    home = os.getenv("FMSG_HOME_CHANNEL", "").strip()
+    if home:
+        seed["home_channel"] = {
+            "chat_id": home,
+            "name": os.getenv("FMSG_HOME_CHANNEL_NAME", "").strip() or home,
+        }
+    return seed
+
+
+async def _standalone_send(
+    pconfig,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: Optional[str] = None,
+    media_files: Optional[List[str]] = None,
+    force_document: bool = False,
+) -> Dict[str, Any]:
+    """Out-of-process send for cron / send_message_tool when no live adapter."""
+    if not HTTPX_AVAILABLE:
+        return {"error": "fmsg standalone send: httpx not installed"}
+    extra = getattr(pconfig, "extra", {}) or {}
+    api_url = (extra.get("api_url") or os.getenv("FMSG_API_URL", "")).strip().rstrip("/")
+    api_key = (extra.get("api_key") or os.getenv("FMSG_API_KEY", "")).strip()
+    if not (api_url and api_key):
+        return {"error": "fmsg standalone send: FMSG_API_URL / FMSG_API_KEY not configured"}
+    if not chat_id:
+        return {"error": "fmsg standalone send: no recipient address"}
+
+    topic = (
+        extra.get("default_topic")
+        or os.getenv("FMSG_DEFAULT_TOPIC", "").strip()
+        or DEFAULT_TOPIC
+    )
+    client = FmsgClient(TokenManager(api_url, api_key))
+    try:
+        await client.tokens.get_token()
+        from_addr = client.tokens.address
+        pid: Optional[int] = None
+        if thread_id:
+            try:
+                pid = int(thread_id)
+            except (TypeError, ValueError):
+                pid = None
+        draft_id = await client.create_draft(
+            from_addr,
+            [chat_id],
+            message[:MAX_MESSAGE_LENGTH],
+            pid=pid,
+            topic=None if pid else topic,
+        )
+        for media_path in media_files or []:
+            p = Path(media_path)
+            try:
+                data = p.read_bytes()
+            except OSError as e:
+                return {"error": f"fmsg standalone send: cannot read {media_path}: {e}"}
+            if len(data) > MAX_ATTACH_BYTES:
+                return {"error": f"fmsg standalone send: {p.name} exceeds attachment limit"}
+            await client.attach(draft_id, p.name, data)
+        await client.send(draft_id)
+        return {
+            "success": True,
+            "platform": "fmsg",
+            "chat_id": chat_id,
+            "message_id": str(draft_id),
+        }
+    except (FmsgAuthError, FmsgApiError) as e:
+        return {"error": f"fmsg standalone send failed: {e}"}
+    except Exception as e:
+        return {"error": f"fmsg standalone send failed: {e}"}
+    finally:
+        await client.aclose()
+
+
+def register(ctx) -> None:
+    """Plugin entry point — called by the Hermes plugin system at startup."""
+    ctx.register_platform(
+        name="fmsg",
+        label="fmsg",
+        adapter_factory=lambda cfg: FmsgAdapter(cfg),
+        check_fn=check_requirements,
+        validate_config=validate_config,
+        is_connected=is_connected,
+        required_env=["FMSG_API_URL", "FMSG_API_KEY"],
+        install_hint="pip install httpx websockets",
+        env_enablement_fn=_env_enablement,
+        cron_deliver_env_var="FMSG_HOME_CHANNEL",
+        standalone_sender_fn=_standalone_send,
+        allowed_users_env="FMSG_ALLOWED_USERS",
+        allow_all_env="FMSG_ALLOW_ALL_USERS",
+        max_message_length=MAX_MESSAGE_LENGTH,
+        emoji="📨",
+        platform_hint=(
+            "You are communicating over fmsg, a federated messaging protocol. "
+            "Messages are plain text (markdown renders client-dependent); files "
+            "travel as attachments. Conversations are threaded: a root message "
+            "carries a topic and replies chain to their parent. Addresses look "
+            "like @user@example.com."
+        ),
+    )
