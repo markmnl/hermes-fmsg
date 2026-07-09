@@ -35,16 +35,36 @@ async def test_reply_resolves_thread_root_via_pid_chain(adapter, fake_api):
     await adapter._on_message(fake_api._public(fake_api.messages[leaf]))
 
     event = adapter.handled_events[0]
+    # Linear first path continues the root session.
     assert event.source.thread_id == str(root)
     assert event.source.chat_topic == "T"
     assert event.reply_to_message_id == str(mid)
-    # Chain is cached: a sibling reply resolves without refetching the root.
-    calls_before = len(fake_api.calls)
+    assert event.metadata.get("fmsg_is_fork") is False
+
+    # A second reply to the same parent is a branch fork → new session key.
     sib = fake_api.seed_message(USER, [BOT_ADDRESS], "sibling", pid=mid)
     await adapter._on_message(fake_api._public(fake_api.messages[sib]))
-    get_calls = [c for c in fake_api.calls[calls_before:] if c.startswith("GET /fmsg/")]
-    assert get_calls == []  # no pid-walk fetches needed
+    fork = adapter.handled_events[1]
+    assert fork.source.thread_id == f"{root}:br:{sib}"
+    assert fork.metadata.get("fmsg_is_fork") is True
+    assert fork.channel_context is not None
+    assert "direct ancestry only" in fork.channel_context
+    assert "root" in fork.channel_context  # ancestry includes root body
+
+
+async def test_linear_replies_share_root_session(adapter, fake_api):
+    await _prime(adapter)
+    root = fake_api.seed_message(USER, [BOT_ADDRESS], "root", topic="T")
+    await adapter._on_message(fake_api._public(fake_api.messages[root]))
+    a = fake_api.seed_message(USER, [BOT_ADDRESS], "a", pid=root)
+    await adapter._on_message(fake_api._public(fake_api.messages[a]))
+    a1 = fake_api.seed_message(USER, [BOT_ADDRESS], "a1", pid=a)
+    await adapter._on_message(fake_api._public(fake_api.messages[a1]))
+
+    assert adapter.handled_events[0].source.thread_id == str(root)
     assert adapter.handled_events[1].source.thread_id == str(root)
+    assert adapter.handled_events[2].source.thread_id == str(root)
+    assert all(e.metadata.get("fmsg_is_fork") is False for e in adapter.handled_events)
 
 
 async def test_marks_read_after_dispatch(adapter, fake_api):
