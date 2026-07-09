@@ -137,3 +137,16 @@ async def test_last_seen_persists_across_instances(adapter, fake_api):
     reloaded._state_path = adapter._state_path
     reloaded._load_state()
     assert reloaded._last_seen_id == msg_id
+
+
+async def test_multi_party_context_and_participant_cache(adapter, fake_api):
+    await _prime(adapter)
+    lisa = "@lisa@example.com"
+    msg_id = fake_api.seed_message(USER, [BOT_ADDRESS, lisa], "hi all", topic="Group")
+    await adapter._on_message(fake_api._public(fake_api.messages[msg_id]))
+    event = adapter.handled_events[0]
+    assert event.metadata.get("fmsg_multi_party") is True
+    assert lisa in event.channel_context
+    assert "reply" in event.channel_context.lower() or "participants" in event.channel_context
+    assert lisa in adapter._msg_participants[str(msg_id)]
+    assert USER in adapter._msg_participants[str(msg_id)]

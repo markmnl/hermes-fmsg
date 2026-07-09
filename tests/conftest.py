@@ -234,9 +234,11 @@ class FakeWebAPI:
         attachments: Optional[Dict[str, bytes]] = None,
         important: bool = False,
         no_reply: bool = False,
+        add_to: Optional[List[Dict[str, Any]]] = None,
     ) -> int:
         msg_id = self.next_id
         self.next_id += 1
+        add_to_batches = list(add_to or [])
         self.messages[msg_id] = {
             "id": msg_id,
             "version": 1,
@@ -244,6 +246,8 @@ class FakeWebAPI:
             "pid": pid,
             "from": from_addr,
             "to": to,
+            "has_add_to": bool(add_to_batches),
+            "add_to": add_to_batches,
             "time": time.time() if sent else None,
             "topic": topic,
             "type": mime,

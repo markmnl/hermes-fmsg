@@ -34,6 +34,14 @@ host, so the allowlist is a real trust boundary). An fmsg thread — a
 root message carrying ``topic`` plus replies chaining ``pid`` — maps to
 a Hermes session via ``thread_id`` = root message id, so each thread
 keeps its own conversation context.
+
+Reply-all default: when replying (``pid`` set), outbound ``to`` is every
+participant on **the parent message** (``from`` + ``to`` + ``add_to``),
+excluding the agent. Keep the full parent recipient set unless there is
+an exceptional reason to subset (e.g. privately warning others about a
+malicious participant) via metadata ``fmsg_to`` / ``recipients`` or
+``fmsg_reply_all=False``. Agent-initiated roots (no ``pid``) stay
+single-recipient.
 """
 
 import asyncio
@@ -114,6 +122,94 @@ def _extra_or_env(extra: Dict[str, Any], key: str, env: str, default: str = "") 
     return str(extra.get(key) or os.getenv(env, default) or default).strip()
 
 
+def _norm_addr(addr: str) -> str:
+    """Case-fold an fmsg address for equality (Unicode default case folding)."""
+    return (addr or "").strip().casefold()
+
+
+def _merge_addrs(*groups: Any) -> List[str]:
+    """Dedupe addresses case-insensitively, preserving first-seen casing/order."""
+    out: List[str] = []
+    seen: set = set()
+    for group in groups:
+        if group is None:
+            continue
+        if isinstance(group, str):
+            items = [group]
+        else:
+            try:
+                items = list(group)
+            except TypeError:
+                continue
+        for raw in items:
+            if not isinstance(raw, str):
+                continue
+            addr = raw.strip()
+            key = _norm_addr(addr)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(addr)
+    return out
+
+
+def participants_from_msg(msg: Dict[str, Any]) -> List[str]:
+    """All participants on a webapi message: from + to + add_to batches."""
+    addrs: List[str] = []
+    frm = msg.get("from")
+    if isinstance(frm, str):
+        addrs.append(frm)
+    to = msg.get("to") or []
+    if isinstance(to, list):
+        addrs.extend(a for a in to if isinstance(a, str))
+    for batch in msg.get("add_to") or []:
+        if isinstance(batch, dict):
+            atf = batch.get("add_to_from")
+            if isinstance(atf, str):
+                addrs.append(atf)
+            batch_to = batch.get("to") or []
+            if isinstance(batch_to, list):
+                addrs.extend(a for a in batch_to if isinstance(a, str))
+        elif isinstance(batch, str):
+            addrs.append(batch)
+    return _merge_addrs(addrs)
+
+
+def filter_recipients(
+    addrs: Any,
+    *,
+    own_address: str = "",
+    fallback: Optional[str] = None,
+) -> List[str]:
+    """Drop self/empties; fall back to a single counterparty if nothing left."""
+    own = _norm_addr(own_address)
+    out: List[str] = []
+    seen: set = set()
+    for raw in addrs or []:
+        if not isinstance(raw, str):
+            continue
+        addr = raw.strip()
+        key = _norm_addr(addr)
+        if not key or key == own or key in seen:
+            continue
+        seen.add(key)
+        out.append(addr)
+    if not out and fallback and _norm_addr(fallback) and _norm_addr(fallback) != own:
+        return [fallback.strip()]
+    return out
+
+
+def _truthy_meta_false(value: Any) -> bool:
+    """True when metadata explicitly disables reply-all."""
+    if value is False:
+        return True
+    if isinstance(value, (int, float)) and value == 0:
+        return True
+    if isinstance(value, str) and value.strip().lower() in ("0", "false", "no", "off"):
+        return True
+    return False
+
+
 def check_requirements() -> bool:
     """Installable and minimally configured (deps + required env)."""
     if not (HTTPX_AVAILABLE and WEBSOCKETS_AVAILABLE):
@@ -158,6 +254,8 @@ class FmsgAdapter(BasePlatformAdapter):
         self._thread_roots: Dict[int, Tuple[int, Optional[str]]] = {}
         # (chat_id, thread_id) -> last inbound message id, for reply threading.
         self._last_inbound: Dict[Tuple[str, str], int] = {}
+        # message id (str) -> participants of that message (from/to/add_to).
+        self._msg_participants: Dict[str, List[str]] = {}
         self._last_seen_id: int = 0
         self._state_path = Path(
             os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))
@@ -325,6 +423,8 @@ class FmsgAdapter(BasePlatformAdapter):
         root_id, topic = await self._resolve_thread_root(msg_id, msg)
         pid = msg.get("pid") if msg.get("has_pid") or msg.get("pid") else None
 
+        participants = self._remember_participants(msg_id, msg)
+
         source = self.build_source(
             chat_id=sender,
             chat_name=sender.lstrip("@").split("@")[0],
@@ -346,6 +446,23 @@ class FmsgAdapter(BasePlatformAdapter):
             context_notes.append(
                 "[the sender flagged no_reply: replies to this fmsg thread will be discarded]"
             )
+
+        others = filter_recipients(
+            participants, own_address=self._own_address(), fallback=None
+        )
+        others_only = [a for a in others if _norm_addr(a) != _norm_addr(sender)]
+        if others_only:
+            listed = ", ".join(others_only)
+            context_notes.append(
+                f"[fmsg multi-party message — other participants on this "
+                f"message: {listed}. Replies default to all participants of "
+                "the parent you reply to; only omit someone in exceptional "
+                "cases (e.g. warning others about abuse).]"
+            )
+            metadata["fmsg_participants"] = others
+            metadata["fmsg_multi_party"] = True
+        else:
+            metadata["fmsg_participants"] = others or ([sender] if sender else [])
 
         ts = msg.get("time")
         try:
@@ -463,6 +580,64 @@ class FmsgAdapter(BasePlatformAdapter):
         self._thread_roots[current] = root
         return root
 
+    def _remember_participants(self, msg_id: int, msg: Dict[str, Any]) -> List[str]:
+        """Cache participants of this message (keyed by message id)."""
+        parts = participants_from_msg(msg)
+        self._msg_participants[str(msg_id)] = parts
+        return parts
+
+    async def _participants_for_message(self, msg_id: int) -> List[str]:
+        """Participants on a specific message — cache hit or GET /fmsg/:id."""
+        key = str(msg_id)
+        cached = self._msg_participants.get(key)
+        if cached is not None:
+            return list(cached)
+        if not self._client:
+            return []
+        try:
+            msg = await self._client.get_message(msg_id)
+        except FmsgApiError as e:
+            logger.debug(
+                "[%s] participant fetch failed for %s: %s", self.name, msg_id, e
+            )
+            return []
+        parts = participants_from_msg(msg)
+        self._msg_participants[key] = parts
+        return parts
+
+    async def _resolve_recipients(
+        self,
+        chat_id: str,
+        pid: Optional[int],
+        metadata: Optional[Dict[str, Any]],
+    ) -> List[str]:
+        """Pick outbound ``to``: parent-message reply-all, override, or single DM.
+
+        Default for a reply is **all participants of the parent message**
+        (the one identified by ``pid``), excluding self. Subsetting is for
+        exceptional cases only (explicit metadata).
+        """
+        metadata = metadata or {}
+        own = self._own_address()
+
+        override = metadata.get("fmsg_to")
+        if override is None:
+            override = metadata.get("recipients")
+        if override is not None:
+            if isinstance(override, str):
+                override = [override]
+            return filter_recipients(override, own_address=own, fallback=chat_id)
+
+        if _truthy_meta_false(metadata.get("fmsg_reply_all", True)):
+            return filter_recipients([chat_id], own_address=own, fallback=chat_id)
+
+        # New root (no parent): single recipient.
+        if pid is None:
+            return filter_recipients([chat_id], own_address=own, fallback=chat_id)
+
+        parent_parts = await self._participants_for_message(pid)
+        return filter_recipients(parent_parts, own_address=own, fallback=chat_id)
+
     # -- Dedup + persistence ---------------------------------------------------
 
     def _is_duplicate(self, msg_id: int) -> bool:
@@ -555,10 +730,11 @@ class FmsgAdapter(BasePlatformAdapter):
             content = content[: self.MAX_MESSAGE_LENGTH]
 
         pid, topic = self._resolve_reply_target(chat_id, reply_to, metadata)
+        recipients = await self._resolve_recipients(chat_id, pid, metadata)
         draft_id: Optional[int] = None
         try:
             draft_id = await self._client.create_draft(
-                from_addr, [chat_id], content, pid=pid, topic=topic
+                from_addr, recipients, content, pid=pid, topic=topic
             )
             for filename, data in attachments or []:
                 await self._client.attach(draft_id, filename, data)
@@ -740,28 +916,44 @@ async def _standalone_send(
                 pid = int(thread_id)
             except (TypeError, ValueError):
                 pid = None
+
+        recipients = [chat_id]
+        if pid is not None:
+            try:
+                parent = await client.get_message(pid)
+                filtered = filter_recipients(
+                    participants_from_msg(parent),
+                    own_address=from_addr or "",
+                    fallback=chat_id,
+                )
+                if filtered:
+                    recipients = filtered
+            except (FmsgApiError, FmsgAuthError) as e:
+                logger.debug("fmsg standalone send: participant lookup failed: %s", e)
+
         draft_id = await client.create_draft(
             from_addr,
-            [chat_id],
+            recipients,
             message[:MAX_MESSAGE_LENGTH],
             pid=pid,
             topic=None if pid else topic,
         )
         for media_path in media_files or []:
-            p = Path(media_path)
+            path = Path(media_path)
             try:
-                data = p.read_bytes()
+                data = path.read_bytes()
             except OSError as e:
                 return {"error": f"fmsg standalone send: cannot read {media_path}: {e}"}
             if len(data) > MAX_ATTACH_BYTES:
-                return {"error": f"fmsg standalone send: {p.name} exceeds attachment limit"}
-            await client.attach(draft_id, p.name, data)
+                return {"error": f"fmsg standalone send: {path.name} exceeds attachment limit"}
+            await client.attach(draft_id, path.name, data)
         await client.send(draft_id)
         return {
             "success": True,
             "platform": "fmsg",
             "chat_id": chat_id,
             "message_id": str(draft_id),
+            "recipients": recipients,
         }
     except (FmsgAuthError, FmsgApiError) as e:
         return {"error": f"fmsg standalone send failed: {e}"}
@@ -794,6 +986,8 @@ def register(ctx) -> None:
             "Messages are plain text (markdown renders client-dependent); files "
             "travel as attachments. Conversations are threaded: a root message "
             "carries a topic and replies chain to their parent. Addresses look "
-            "like @user@example.com."
+            "like @user@example.com. Replies default to all participants of the message you are replying to (reply-all on that parent). Only omit someone in exceptional cases (e.g. privately warning others about malicious behaviour) — normal group answers should keep everyone."
+            "participants by default (reply-all); you do not need a special tool "
+            "for that."
         ),
     )
