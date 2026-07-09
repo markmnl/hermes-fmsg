@@ -290,3 +290,85 @@ async def test_new_inbound_resets_outbound_chain(adapter, fake_api):
         USER, "next answer", reply_to=str(follow), metadata={"thread_id": str(root)}
     )
     assert fake_api.messages[int(r2.message_id)]["pid"] == follow
+
+
+async def test_agent_initiated_continues_dm_thread(adapter, fake_api):
+    """Gateway home-channel style send (no reply_to/thread_id) parents to last DM."""
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(USER, [BOT_ADDRESS], "hey", topic="DM")
+    await adapter._on_message(fake_api._public(fake_api.messages[root]))
+
+    down = await adapter.send(USER, "⚠️ Gateway restarting")
+    up = await adapter.send(USER, "♻️ Gateway online")
+    m_down = fake_api.messages[int(down.message_id)]
+    m_up = fake_api.messages[int(up.message_id)]
+    assert m_down["pid"] == root
+    assert m_down["topic"] is None
+    assert m_up["pid"] == int(down.message_id)  # chain notices too
+    assert m_up["topic"] is None
+
+
+async def test_agent_initiated_cold_lookup_from_api(adapter, fake_api):
+    """After restart (empty memory) still finds last DM via list_messages/list_sent."""
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(USER, [BOT_ADDRESS], "prior chat", topic="DM")
+    # Seed a prior outbound the adapter never saw in-process.
+    prior = fake_api.seed_message(BOT_ADDRESS, [USER], "earlier notice", pid=root)
+    assert adapter._last_by_chat == {}
+
+    result = await adapter.send(USER, "♻️ Gateway online")
+    msg = fake_api.messages[int(result.message_id)]
+    assert msg["pid"] == prior  # latest DM with USER
+    assert msg["topic"] is None
+
+
+async def test_fmsg_new_thread_forces_root(adapter, fake_api):
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(USER, [BOT_ADDRESS], "hey", topic="DM")
+    await adapter._on_message(fake_api._public(fake_api.messages[root]))
+
+    result = await adapter.send(
+        USER,
+        "brand new topic",
+        metadata={"fmsg_new_thread": True, "topic": "Alerts"},
+    )
+    msg = fake_api.messages[int(result.message_id)]
+    assert msg["pid"] is None
+    assert msg["topic"] == "Alerts"
+
+
+async def test_agent_initiated_skips_multi_party_parent(adapter, fake_api):
+    """Home-channel pings must not attach to a multi-party parent."""
+    await adapter._tokens.get_token()
+    group = fake_api.seed_message(
+        MARK, [BOT_ADDRESS, LISA], "group", topic="G"
+    )
+    await adapter._on_message(fake_api._public(fake_api.messages[group]))
+    # Only multi-party history with MARK — no pure DM — so a root is OK.
+    result = await adapter.send(MARK, "⚠️ Gateway restarting")
+    msg = fake_api.messages[int(result.message_id)]
+    assert msg["pid"] is None
+    assert msg["topic"] == "Hermes"
+
+
+async def test_standalone_send_continues_dm(fake_api, monkeypatch):
+    import plugin.adapter as adapter_mod
+    import plugin.fmsg_client as client_mod
+    import httpx
+
+    real_async_client = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = fake_api.transport()
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", patched)
+
+    root = fake_api.seed_message(USER, [BOT_ADDRESS], "dm", topic="T")
+    prior = fake_api.seed_message(BOT_ADDRESS, [USER], "old cron", pid=root)
+    pconfig = SimpleNamespace(extra={"api_url": "http://fmsg.test", "api_key": API_KEY})
+    result = await adapter_mod._standalone_send(pconfig, USER, "cron says hi")
+    assert result.get("success") is True
+    msg = fake_api.messages[int(result["message_id"])]
+    assert msg["pid"] == prior
+    assert msg["topic"] is None

@@ -164,6 +164,11 @@ class FmsgClient:
         resp = await self._request("GET", "/fmsg", params={"limit": limit, "offset": offset})
         return resp.json() or []
 
+    async def list_sent(self, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
+        """Messages authored by the authenticated identity (GET /fmsg/sent)."""
+        resp = await self._request("GET", "/fmsg/sent", params={"limit": limit, "offset": offset})
+        return resp.json() or []
+
     async def get_message(self, msg_id: int) -> Dict[str, Any]:
         resp = await self._request("GET", f"/fmsg/{msg_id}")
         return resp.json()

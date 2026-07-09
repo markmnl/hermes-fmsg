@@ -47,6 +47,12 @@ Multi-message agent turns chain: the first outbound replies to the
 inbound parent; each further outbound in the same thread replies to the
 previous outbound (not all siblings of the user prompt). A new inbound
 resets the chain so the next reply targets the new user message.
+
+Agent-initiated sends (no ``reply_to`` / no ``thread_id`` — gateway
+home-channel online/offline notices, cron without a thread, etc.) continue
+the latest **1:1 DM** with that chat address instead of opening a new root
+every time. Force a fresh root with metadata ``fmsg_new_thread=true``
+(optional ``topic`` override; default ``FMSG_DEFAULT_TOPIC``).
 """
 
 import asyncio
@@ -204,6 +210,27 @@ def filter_recipients(
     return out
 
 
+def is_dm_with(msg: Dict[str, Any], chat_id: str, own_address: str = "") -> bool:
+    """True when ``msg`` is a 1:1 exchange between ``own_address`` and ``chat_id``.
+
+    Multi-party parents are excluded so agent-initiated home-channel pings
+    never attach to a group thread.
+    """
+    others = filter_recipients(participants_from_msg(msg), own_address=own_address)
+    return len(others) == 1 and _norm_addr(others[0]) == _norm_addr(chat_id)
+
+
+def _truthy_meta(value: Any) -> bool:
+    """True when metadata explicitly enables a flag."""
+    if value is True:
+        return True
+    if isinstance(value, (int, float)) and value == 1:
+        return True
+    if isinstance(value, str) and value.strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    return False
+
+
 def _truthy_meta_false(value: Any) -> bool:
     """True when metadata explicitly disables reply-all."""
     if value is False:
@@ -263,6 +290,9 @@ class FmsgAdapter(BasePlatformAdapter):
         self._last_outbound: Dict[Tuple[str, str], int] = {}
         # message id (str) -> participants of that message (from/to/add_to).
         self._msg_participants: Dict[str, List[str]] = {}
+        # normalised chat_id -> last 1:1 DM message id (either direction).
+        # Used so agent-initiated home/cron pings continue the existing thread.
+        self._last_by_chat: Dict[str, int] = {}
         self._last_seen_id: int = 0
         self._state_path = Path(
             os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))
@@ -500,6 +530,10 @@ class FmsgAdapter(BasePlatformAdapter):
         # New user message starts a new agent turn — do not keep chaining
         # to the previous outbound.
         self._last_outbound.pop(thread_key, None)
+        # Track pure DMs so agent-initiated sends (home-channel notices) can
+        # continue the conversation instead of spawning a new root.
+        if not others_only:
+            self._note_chat_message(sender, msg_id)
         logger.debug("[%s] Message %s from %s: %s", self.name, msg_id, sender, text[:80])
         await self.handle_message(event)
         self._record_seen(msg_id)
@@ -669,15 +703,47 @@ class FmsgAdapter(BasePlatformAdapter):
         try:
             state = json.loads(self._state_path.read_text())
             self._last_seen_id = int(state.get("last_seen_id", 0))
+            raw = state.get("last_by_chat") or {}
+            self._last_by_chat = {}
+            if isinstance(raw, dict):
+                for k, v in raw.items():
+                    if not isinstance(k, str):
+                        continue
+                    try:
+                        self._last_by_chat[_norm_addr(k)] = int(v)
+                    except (TypeError, ValueError):
+                        continue
         except (OSError, ValueError, json.JSONDecodeError):
             self._last_seen_id = 0
+            self._last_by_chat = {}
 
     def _save_state(self) -> None:
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            self._state_path.write_text(json.dumps({"last_seen_id": self._last_seen_id}))
+            self._state_path.write_text(
+                json.dumps(
+                    {
+                        "last_seen_id": self._last_seen_id,
+                        "last_by_chat": self._last_by_chat,
+                    }
+                )
+            )
         except OSError as e:
             logger.debug("[%s] Could not persist last_seen state: %s", self.name, e)
+
+    def _note_chat_message(self, chat_id: str, message_id: int) -> None:
+        """Remember the latest 1:1 message with ``chat_id`` (either direction)."""
+        key = _norm_addr(chat_id)
+        if not key:
+            return
+        try:
+            mid = int(message_id)
+        except (TypeError, ValueError):
+            return
+        prev = self._last_by_chat.get(key, 0)
+        if mid > prev:
+            self._last_by_chat[key] = mid
+            self._save_state()
 
     # -- Outbound -----------------------------------------------------------------
 
@@ -694,10 +760,16 @@ class FmsgAdapter(BasePlatformAdapter):
         parents to the previous outbound. Gateway often passes the same
         inbound id as ``reply_to`` for every chunk — last_outbound wins so
         those chunks do not all become siblings of the user prompt.
+
+        Agent-initiated sends (no thread_id / reply_to) continue the latest
+        known 1:1 DM with ``chat_id`` when available; otherwise open a root
+        with the default topic (or metadata ``topic`` when forcing a new
+        thread via ``fmsg_new_thread``).
         """
         metadata = metadata or {}
         thread_id = metadata.get("thread_id")
         key = (chat_id, str(thread_id)) if thread_id is not None else None
+        force_new = _truthy_meta(metadata.get("fmsg_new_thread"))
 
         reply_to_id: Optional[int] = None
         if reply_to:
@@ -730,6 +802,15 @@ class FmsgAdapter(BasePlatformAdapter):
                 pass
         elif reply_to_id is not None:
             return reply_to_id, None
+
+        if not force_new:
+            last_dm = self._last_by_chat.get(_norm_addr(chat_id))
+            if last_dm:
+                return last_dm, None
+
+        topic = metadata.get("topic") if force_new else None
+        if isinstance(topic, str) and topic.strip():
+            return None, topic.strip()
         return None, self._default_topic
 
     def _record_outbound(
@@ -760,6 +841,49 @@ class FmsgAdapter(BasePlatformAdapter):
         self._msg_participants[str(message_id)] = _merge_addrs(
             [own] if own else [], recipients
         )
+        # Pure 1:1 outbound → remember for the next agent-initiated ping.
+        if len(recipients) == 1 and _norm_addr(recipients[0]) == _norm_addr(chat_id):
+            self._note_chat_message(chat_id, message_id)
+
+    async def _lookup_last_dm_message(self, chat_id: str) -> Optional[int]:
+        """Find the latest 1:1 message with ``chat_id`` (memory, then API).
+
+        Used after a cold start so gateway home-channel notices still attach
+        to the existing DM thread rather than opening a new root.
+        """
+        key = _norm_addr(chat_id)
+        if not key:
+            return None
+        cached = self._last_by_chat.get(key)
+        if cached:
+            return cached
+        if not self._client:
+            return None
+        own = self._own_address()
+        best: Optional[int] = None
+        try:
+            inbox = await self._client.list_messages(limit=50)
+            sent = await self._client.list_sent(limit=50)
+        except (FmsgApiError, FmsgAuthError) as e:
+            logger.debug("[%s] last-DM lookup failed for %s: %s", self.name, chat_id, e)
+            return None
+        for msg in list(inbox or []) + list(sent or []):
+            if not isinstance(msg, dict):
+                continue
+            mid = msg.get("id")
+            if mid is None:
+                continue
+            if not is_dm_with(msg, chat_id, own):
+                continue
+            try:
+                mid_i = int(mid)
+            except (TypeError, ValueError):
+                continue
+            if best is None or mid_i > best:
+                best = mid_i
+        if best is not None:
+            self._note_chat_message(chat_id, best)
+        return best
 
     async def send(
         self,
@@ -797,6 +921,17 @@ class FmsgAdapter(BasePlatformAdapter):
             content = content[: self.MAX_MESSAGE_LENGTH]
 
         pid, topic = self._resolve_reply_target(chat_id, reply_to, metadata)
+        metadata = metadata or {}
+        # Cold start / empty cache: look up the latest 1:1 DM so home-channel
+        # gateway notices keep the existing thread after a restart.
+        if (
+            pid is None
+            and topic is not None
+            and not _truthy_meta(metadata.get("fmsg_new_thread"))
+        ):
+            found = await self._lookup_last_dm_message(chat_id)
+            if found is not None:
+                pid, topic = found, None
         recipients = await self._resolve_recipients(chat_id, pid, metadata)
         draft_id: Optional[int] = None
         try:
@@ -984,6 +1119,26 @@ async def _standalone_send(
                 pid = int(thread_id)
             except (TypeError, ValueError):
                 pid = None
+
+        # No explicit thread: continue the latest 1:1 DM with chat_id so
+        # cron / home-channel delivery stays in one conversation.
+        if pid is None:
+            best: Optional[int] = None
+            try:
+                for msg in list(await client.list_messages(limit=50) or []) + list(
+                    await client.list_sent(limit=50) or []
+                ):
+                    if not isinstance(msg, dict) or msg.get("id") is None:
+                        continue
+                    if not is_dm_with(msg, chat_id, from_addr or ""):
+                        continue
+                    mid = int(msg["id"])
+                    if best is None or mid > best:
+                        best = mid
+            except (FmsgApiError, FmsgAuthError, TypeError, ValueError) as e:
+                logger.debug("fmsg standalone send: last-DM lookup failed: %s", e)
+            if best is not None:
+                pid = best
 
         recipients = [chat_id]
         if pid is not None:
