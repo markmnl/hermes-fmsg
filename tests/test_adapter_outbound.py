@@ -119,3 +119,174 @@ async def test_standalone_send_missing_config(fake_api, monkeypatch):
     pconfig = SimpleNamespace(extra={})
     result = await adapter_mod._standalone_send(pconfig, USER, "hi")
     assert "error" in result
+
+
+LISA = "@lisa@example.com"
+MARK = "@mark@example.com"
+
+
+async def test_reply_all_multi_party_thread(adapter, fake_api):
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(
+        MARK, [BOT_ADDRESS, LISA], "hi guys", topic="What do you think?"
+    )
+    await adapter._on_message(fake_api._public(fake_api.messages[root]))
+
+    result = await adapter.send(
+        MARK, "pros and cons...", reply_to=str(root), metadata={"thread_id": str(root)}
+    )
+    assert result.success
+    msg = fake_api.messages[int(result.message_id)]
+    assert msg["pid"] == root
+    assert msg["topic"] is None
+    assert set(msg["to"]) == {MARK, LISA}
+    assert BOT_ADDRESS not in msg["to"]
+
+
+async def test_dm_reply_stays_single_recipient(adapter, fake_api):
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(USER, [BOT_ADDRESS], "only us", topic="DM")
+    await adapter._on_message(fake_api._public(fake_api.messages[root]))
+    result = await adapter.send(USER, "ok", reply_to=str(root), metadata={"thread_id": str(root)})
+    msg = fake_api.messages[int(result.message_id)]
+    assert msg["to"] == [USER]
+
+
+async def test_reply_all_false_forces_single(adapter, fake_api):
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(MARK, [BOT_ADDRESS, LISA], "group", topic="G")
+    await adapter._on_message(fake_api._public(fake_api.messages[root]))
+    result = await adapter.send(
+        MARK,
+        "private aside",
+        reply_to=str(root),
+        metadata={"thread_id": str(root), "fmsg_reply_all": False},
+    )
+    msg = fake_api.messages[int(result.message_id)]
+    assert msg["to"] == [MARK]
+
+
+async def test_fmsg_to_override(adapter, fake_api):
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(MARK, [BOT_ADDRESS, LISA], "group", topic="G")
+    await adapter._on_message(fake_api._public(fake_api.messages[root]))
+    only_lisa = "@other@example.com"
+    result = await adapter.send(
+        MARK,
+        "override",
+        reply_to=str(root),
+        metadata={"thread_id": str(root), "fmsg_to": [only_lisa, BOT_ADDRESS]},
+    )
+    msg = fake_api.messages[int(result.message_id)]
+    # self excluded even if listed
+    assert msg["to"] == [only_lisa]
+
+
+async def test_add_to_participants_included(adapter, fake_api):
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(
+        MARK,
+        [BOT_ADDRESS],
+        "start",
+        topic="G",
+        add_to=[{"add_to_from": MARK, "to": [LISA], "time": 1.0}],
+    )
+    await adapter._on_message(fake_api._public(fake_api.messages[root]))
+    result = await adapter.send(
+        MARK, "to all", reply_to=str(root), metadata={"thread_id": str(root)}
+    )
+    msg = fake_api.messages[int(result.message_id)]
+    assert set(msg["to"]) == {MARK, LISA}
+
+
+async def test_reply_all_fetches_when_cache_cold(adapter, fake_api):
+    """No inbound processing — resolve participants via GET on pid."""
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(MARK, [BOT_ADDRESS, LISA], "cold", topic="C")
+    result = await adapter.send(MARK, "answer", reply_to=str(root))
+    msg = fake_api.messages[int(result.message_id)]
+    assert set(msg["to"]) == {MARK, LISA}
+
+
+async def test_reply_uses_parent_message_participants_not_whole_thread(adapter, fake_api):
+    """Recipients follow the parent message, not historical thread union."""
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(MARK, [BOT_ADDRESS, LISA], "all", topic="T")
+    await adapter._on_message(fake_api._public(fake_api.messages[root]))
+    later = fake_api.seed_message(MARK, [BOT_ADDRESS], "only agent", pid=root)
+    await adapter._on_message(fake_api._public(fake_api.messages[later]))
+
+    # Reply to the narrow parent → only Mark.
+    result = await adapter.send(
+        MARK, "private", reply_to=str(later), metadata={"thread_id": str(root)}
+    )
+    msg = fake_api.messages[int(result.message_id)]
+    assert msg["to"] == [MARK]
+    assert msg["pid"] == later
+
+    # Reply to the multi-party root → Mark + Lisa.
+    result2 = await adapter.send(
+        MARK, "group answer", reply_to=str(root), metadata={"thread_id": str(root)}
+    )
+    msg2 = fake_api.messages[int(result2.message_id)]
+    assert set(msg2["to"]) == {MARK, LISA}
+    assert msg2["pid"] == root
+
+
+async def test_standalone_send_reply_all(fake_api, monkeypatch):
+    import plugin.adapter as adapter_mod
+    import plugin.fmsg_client as client_mod
+    import httpx
+
+    real_async_client = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = fake_api.transport()
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", patched)
+
+    root = fake_api.seed_message(MARK, [BOT_ADDRESS, LISA], "group root", topic="T")
+    pconfig = SimpleNamespace(extra={"api_url": "http://fmsg.test", "api_key": API_KEY})
+    result = await adapter_mod._standalone_send(
+        pconfig, MARK, "cron into thread", thread_id=str(root)
+    )
+    assert result.get("success") is True
+    msg = fake_api.messages[int(result["message_id"])]
+    assert set(msg["to"]) == {MARK, LISA}
+    assert msg["pid"] == root
+
+
+async def test_multi_message_agent_turn_chains_pids(adapter, fake_api):
+    """Second agent send parents to the first outbound, not the user prompt."""
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(USER, [BOT_ADDRESS], "prompt", topic="Q")
+    await adapter._on_message(fake_api._public(fake_api.messages[root]))
+
+    r1 = await adapter.send(
+        USER, "first chunk", reply_to=str(root), metadata={"thread_id": str(root)}
+    )
+    r2 = await adapter.send(
+        USER, "second chunk", reply_to=str(root), metadata={"thread_id": str(root)}
+    )
+    m1 = fake_api.messages[int(r1.message_id)]
+    m2 = fake_api.messages[int(r2.message_id)]
+    assert m1["pid"] == root
+    assert m2["pid"] == int(r1.message_id)  # chained, not both to root
+
+
+async def test_new_inbound_resets_outbound_chain(adapter, fake_api):
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(USER, [BOT_ADDRESS], "prompt", topic="Q")
+    await adapter._on_message(fake_api._public(fake_api.messages[root]))
+    r1 = await adapter.send(
+        USER, "answer", reply_to=str(root), metadata={"thread_id": str(root)}
+    )
+    assert fake_api.messages[int(r1.message_id)]["pid"] == root
+
+    follow = fake_api.seed_message(USER, [BOT_ADDRESS], "follow up", pid=root)
+    await adapter._on_message(fake_api._public(fake_api.messages[follow]))
+    r2 = await adapter.send(
+        USER, "next answer", reply_to=str(follow), metadata={"thread_id": str(root)}
+    )
+    assert fake_api.messages[int(r2.message_id)]["pid"] == follow

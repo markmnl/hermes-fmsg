@@ -26,22 +26,13 @@ should list **fmsg** once the env vars below are set.
 ## Create the agent's fmsg identity
 
 Run the agent as a **derived sub-account** of your own address so it has its
-own revocable identity (e.g. `@alice_hermes@example.com`). On the fmsg host:
+own revocable identity (e.g. `@alice_hermes@example.com`).
 
-```bash
-cd fmsg-webapi
-go run ./cmd/fmsg-webapi api-key create \
-  -owner @alice@example.com \
-  -agent hermes \
-  -cidr 203.0.113.7/32          # optional: lock to the gateway host
-```
-
-This prints the plaintext API key once. Deleting the grant (or expiring the
-key) invalidates live JWTs on their next request.
+**You need to create your fmsg sub-account and obtain an API key, check your fmsg host.**
 
 ## Configure
 
-In `~/.hermes/.env` (names match fmsg-cli, so one `.env` can drive both):
+In `~/.hermes/.env`:
 
 ```bash
 FMSG_API_URL=https://fmsgapi.example.com
@@ -72,18 +63,40 @@ Environment variables win over `config.yaml`.
 
 ## How fmsg concepts map to Hermes
 
-| fmsg | Hermes |
-|---|---|
-| counterparty address `@user@domain` | chat + user identity (DM) |
-| thread: root message with `topic`, replies chaining `pid` | session `thread_id` = root message id — each fmsg thread is its own conversation context |
-| `short_text` / `GET /fmsg/:id/data` | inbound message text |
-| attachments | inbound: cached for the agent's vision/file tools; outbound: agent files sent as fmsg attachments |
-| `important` / `no_reply` | surfaced to the agent as message context |
-| `POST /fmsg/:id/read` | read receipt after the agent handles a message |
+| fmsg                                                      | Hermes                                                                                            |
+|-----------------------------------------------------------|---------------------------------------------------------------------------------------------------|
+| counterparty address `@user@domain`                       | chat + user identity (DM)                                                                         |
+| thread: root message with `topic`, replies chaining `pid` | session `thread_id` = root message id — each fmsg thread is its own conversation context          |
+| `short_text` / `GET /fmsg/:id/data`                       | inbound message text                                                                              |
+| attachments                                               | inbound: cached for the agent's vision/file tools; outbound: agent files sent as fmsg attachments |
+| `important` / `no_reply`                                  | surfaced to the agent as message context                                                          |
+| multi-party parent `from`/`to`/`add_to`                   | reply-all to **that parent’s** participants by default; subset only in exceptional cases          |
+| `POST /fmsg/:id/read`                                     | read receipt after the agent handles a message                                                    |
 
-The agent's replies set `pid` to the latest inbound message of the thread.
+
+Within a thread, the first agent reply sets `pid` to the latest inbound; further agent messages in the same turn chain to the previous outbound (so multi-chunk answers form a line, not siblings of the user prompt). A new inbound resets the chain.
 Agent-initiated messages (cron jobs, notifications) open a new root thread
 with `FMSG_DEFAULT_TOPIC`.
+
+### Multi-party / reply-all
+
+**Default:** a reply’s `to` is every participant on **the parent message**
+you are replying to (`from` + `to` + `add_to`, excluding the agent). That is
+normal reply-all on that message — keep everyone unless you have a strong
+reason not to (e.g. privately warning others about a malicious participant).
+
+| Situation | Outbound `to` |
+|-----------|----------------|
+| Reply to a DM parent | that counterparty |
+| Reply to a multi-party parent | all other participants on **that** parent |
+| Reply to a later 1:1 message in a group thread | only that message’s participants (not the whole history) |
+| New root (cron / no `pid`) | single target (home / chat_id) |
+| Metadata `fmsg_reply_all=false` | counterparty only (exceptional) |
+| Metadata `fmsg_to` / `recipients` | explicit list (self stripped; exceptional subset) |
+
+Parent participants are cached on inbound by message id and re-fetched via
+`GET /fmsg/:id` when the cache is cold. Multi-party parents also get a short
+channel-context note for the model.
 
 ## Development
 
@@ -115,7 +128,3 @@ FMSG_E2E_PEER_KEY=fmsgk_...  \
 - Upstream to `NousResearch/hermes-agent` as a bundled plugin under
   `plugins/platforms/fmsg/` (the directory layout here matches theirs, so
   the move is mechanical).
-
-## License
-
-MIT
