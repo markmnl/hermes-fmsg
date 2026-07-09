@@ -255,3 +255,38 @@ async def test_standalone_send_reply_all(fake_api, monkeypatch):
     msg = fake_api.messages[int(result["message_id"])]
     assert set(msg["to"]) == {MARK, LISA}
     assert msg["pid"] == root
+
+
+async def test_multi_message_agent_turn_chains_pids(adapter, fake_api):
+    """Second agent send parents to the first outbound, not the user prompt."""
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(USER, [BOT_ADDRESS], "prompt", topic="Q")
+    await adapter._on_message(fake_api._public(fake_api.messages[root]))
+
+    r1 = await adapter.send(
+        USER, "first chunk", reply_to=str(root), metadata={"thread_id": str(root)}
+    )
+    r2 = await adapter.send(
+        USER, "second chunk", reply_to=str(root), metadata={"thread_id": str(root)}
+    )
+    m1 = fake_api.messages[int(r1.message_id)]
+    m2 = fake_api.messages[int(r2.message_id)]
+    assert m1["pid"] == root
+    assert m2["pid"] == int(r1.message_id)  # chained, not both to root
+
+
+async def test_new_inbound_resets_outbound_chain(adapter, fake_api):
+    await adapter._tokens.get_token()
+    root = fake_api.seed_message(USER, [BOT_ADDRESS], "prompt", topic="Q")
+    await adapter._on_message(fake_api._public(fake_api.messages[root]))
+    r1 = await adapter.send(
+        USER, "answer", reply_to=str(root), metadata={"thread_id": str(root)}
+    )
+    assert fake_api.messages[int(r1.message_id)]["pid"] == root
+
+    follow = fake_api.seed_message(USER, [BOT_ADDRESS], "follow up", pid=root)
+    await adapter._on_message(fake_api._public(fake_api.messages[follow]))
+    r2 = await adapter.send(
+        USER, "next answer", reply_to=str(follow), metadata={"thread_id": str(root)}
+    )
+    assert fake_api.messages[int(r2.message_id)]["pid"] == follow

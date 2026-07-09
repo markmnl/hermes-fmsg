@@ -74,7 +74,7 @@ Environment variables win over `config.yaml`.
 | `POST /fmsg/:id/read`                                     | read receipt after the agent handles a message                                                    |
 
 
-The agent's replies set `pid` to the latest inbound message of the thread.
+Within a thread, the first agent reply sets `pid` to the latest inbound; further agent messages in the same turn chain to the previous outbound (so multi-chunk answers form a line, not siblings of the user prompt). A new inbound resets the chain.
 Agent-initiated messages (cron jobs, notifications) open a new root thread
 with `FMSG_DEFAULT_TOPIC`.
 

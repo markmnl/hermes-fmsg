@@ -42,6 +42,11 @@ an exceptional reason to subset (e.g. privately warning others about a
 malicious participant) via metadata ``fmsg_to`` / ``recipients`` or
 ``fmsg_reply_all=False``. Agent-initiated roots (no ``pid``) stay
 single-recipient.
+
+Multi-message agent turns chain: the first outbound replies to the
+inbound parent; each further outbound in the same thread replies to the
+previous outbound (not all siblings of the user prompt). A new inbound
+resets the chain so the next reply targets the new user message.
 """
 
 import asyncio
@@ -254,6 +259,8 @@ class FmsgAdapter(BasePlatformAdapter):
         self._thread_roots: Dict[int, Tuple[int, Optional[str]]] = {}
         # (chat_id, thread_id) -> last inbound message id, for reply threading.
         self._last_inbound: Dict[Tuple[str, str], int] = {}
+        # (chat_id, thread_id) -> last outbound message id, for chaining agent turns.
+        self._last_outbound: Dict[Tuple[str, str], int] = {}
         # message id (str) -> participants of that message (from/to/add_to).
         self._msg_participants: Dict[str, List[str]] = {}
         self._last_seen_id: int = 0
@@ -488,7 +495,11 @@ class FmsgAdapter(BasePlatformAdapter):
             timestamp=timestamp,
         )
 
-        self._last_inbound[(sender, str(root_id))] = msg_id
+        thread_key = (sender, str(root_id))
+        self._last_inbound[thread_key] = msg_id
+        # New user message starts a new agent turn — do not keep chaining
+        # to the previous outbound.
+        self._last_outbound.pop(thread_key, None)
         logger.debug("[%s] Message %s from %s: %s", self.name, msg_id, sender, text[:80])
         await self.handle_message(event)
         self._record_seen(msg_id)
@@ -676,23 +687,79 @@ class FmsgAdapter(BasePlatformAdapter):
     def _resolve_reply_target(
         self, chat_id: str, reply_to: Optional[str], metadata: Optional[Dict[str, Any]]
     ) -> Tuple[Optional[int], Optional[str]]:
-        """Return (pid, topic) for an outbound message — exactly one is set."""
+        """Return (pid, topic) for an outbound message — exactly one is set.
+
+        Within a thread, multi-message agent turns chain: the first outbound
+        parents to the inbound (or explicit reply_to); each further outbound
+        parents to the previous outbound. Gateway often passes the same
+        inbound id as ``reply_to`` for every chunk — last_outbound wins so
+        those chunks do not all become siblings of the user prompt.
+        """
         metadata = metadata or {}
+        thread_id = metadata.get("thread_id")
+        key = (chat_id, str(thread_id)) if thread_id is not None else None
+
+        reply_to_id: Optional[int] = None
         if reply_to:
             try:
-                return int(reply_to), None
+                reply_to_id = int(reply_to)
             except (TypeError, ValueError):
-                pass
-        thread_id = metadata.get("thread_id")
-        if thread_id is not None:
-            last = self._last_inbound.get((chat_id, str(thread_id)))
-            if last:
-                return last, None
+                reply_to_id = None
+
+        if key is not None:
+            last_out = self._last_outbound.get(key)
+            last_in = self._last_inbound.get(key)
+            if last_out:
+                # Chain when gateway re-uses the inbound id as reply_to for
+                # every chunk, or when no distinct reply_to is given.
+                if (
+                    reply_to_id is None
+                    or reply_to_id == last_in
+                    or reply_to_id == last_out
+                ):
+                    return last_out, None
+                # Distinct explicit parent (e.g. re-target multi-party root).
+                return reply_to_id, None
+            if reply_to_id is not None:
+                return reply_to_id, None
+            if last_in:
+                return last_in, None
             try:
                 return int(thread_id), None  # reply to the thread root
             except (TypeError, ValueError):
                 pass
+        elif reply_to_id is not None:
+            return reply_to_id, None
         return None, self._default_topic
+
+    def _record_outbound(
+        self,
+        chat_id: str,
+        message_id: int,
+        pid: Optional[int],
+        recipients: List[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        """Remember this send so the next agent message in-thread can chain.
+
+        Also caches participants of the outbound message so a chained
+        follow-up reply-alls to the same set without an extra GET.
+        """
+        metadata = metadata or {}
+        thread_id = metadata.get("thread_id")
+        if thread_id is None and pid is not None:
+            if pid in self._thread_roots:
+                thread_id = self._thread_roots[pid][0]
+            else:
+                # Walk known roots; otherwise use pid as a temporary key
+                # until an inbound establishes the real root.
+                thread_id = pid
+        if thread_id is not None:
+            self._last_outbound[(chat_id, str(thread_id))] = message_id
+        own = self._own_address()
+        self._msg_participants[str(message_id)] = _merge_addrs(
+            [own] if own else [], recipients
+        )
 
     async def send(
         self,
@@ -739,6 +806,7 @@ class FmsgAdapter(BasePlatformAdapter):
             for filename, data in attachments or []:
                 await self._client.attach(draft_id, filename, data)
             await self._client.send(draft_id)
+            self._record_outbound(chat_id, draft_id, pid, recipients, metadata)
             return SendResult(success=True, message_id=str(draft_id))
         except FmsgAuthError as e:
             return SendResult(success=False, error=str(e))
@@ -986,7 +1054,7 @@ def register(ctx) -> None:
             "Messages are plain text (markdown renders client-dependent); files "
             "travel as attachments. Conversations are threaded: a root message "
             "carries a topic and replies chain to their parent. Addresses look "
-            "like @user@example.com. Replies default to all participants of the message you are replying to (reply-all on that parent). Only omit someone in exceptional cases (e.g. privately warning others about malicious behaviour) — normal group answers should keep everyone."
+            "like @user@example.com. Replies default to all participants of the message you are replying to (reply-all on that parent). Only omit someone in exceptional cases (e.g. privately warning others about malicious behaviour) — normal group answers should keep everyone. When you send multiple messages in one turn they chain (each replies to the previous), not all to the same user prompt."
             "participants by default (reply-all); you do not need a special tool "
             "for that."
         ),
