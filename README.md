@@ -66,7 +66,7 @@ Environment variables win over `config.yaml`.
 | fmsg                                                      | Hermes                                                                                            |
 |-----------------------------------------------------------|---------------------------------------------------------------------------------------------------|
 | counterparty address `@user@domain`                       | chat + user identity (DM)                                                                         |
-| thread: root message with `topic`, replies chaining `pid` | session `thread_id` = root message id — each fmsg thread is its own conversation context          |
+| thread tree (root + branching `pid` replies)              | Hermes session per **branch**: first child keeps parent session; later siblings fork (`{root}:br:{id}`) with ancestry-only context |
 | `short_text` / `GET /fmsg/:id/data`                       | inbound message text                                                                              |
 | attachments                                               | inbound: cached for the agent's vision/file tools; outbound: agent files sent as fmsg attachments |
 | `important` / `no_reply`                                  | surfaced to the agent as message context                                                          |

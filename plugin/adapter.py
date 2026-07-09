@@ -30,10 +30,22 @@ fmsg-cli so one .env can drive both):
 
 Identity/threading model: the counterparty fmsg address is both
 ``chat_id`` and ``user_id`` (fmsg addresses are authenticated by the
-host, so the allowlist is a real trust boundary). An fmsg thread — a
-root message carrying ``topic`` plus replies chaining ``pid`` — maps to
-a Hermes session via ``thread_id`` = root message id, so each thread
-keeps its own conversation context.
+host, so the allowlist is a real trust boundary). An fmsg conversation
+is a **tree** (root + ``pid`` replies that may branch). Hermes sessions
+are linear, so this adapter maps each **branch** of that tree to a
+session:
+
+* First reply to a parent continues the parent's Hermes session
+  (``thread_id`` stays the branch key, usually the root id).
+* A later reply to a parent that already has a child is a **fork**:
+  new ``thread_id`` = ``{root_id}:br:{msg_id}``, and the direct
+  ancestry (root → … → parent) is injected as ``channel_context`` so
+  the new session is not blank — similar in spirit to Hermes
+  ``/branch``, but ancestry-only rather than copying sibling history.
+
+Hermes core ``/branch`` copies the *full* transcript onto the same
+routing key; adapters cannot call that API, so fmsg implements the
+fork by changing ``thread_id`` (new session key) + hydrating ancestry.
 
 Reply-all default: when replying (``pid`` set), outbound ``to`` is every
 participant on **the parent message** (``from`` + ``to`` + ``add_to``),
@@ -120,6 +132,9 @@ DEDUP_MAX_SIZE = 1000
 RECONNECT_BACKOFF_MAX = 60.0
 CATCHUP_PAGE_LIMIT = 100
 FIRST_RUN_CATCHUP_MAX = 50  # unread backlog cap on a brand-new install
+# Cap ancestry hydration injected into channel_context on a branch fork.
+MAX_ANCESTRY_CONTEXT_MSGS = 20
+MAX_ANCESTRY_CONTEXT_CHARS = 8000
 
 _KIND_TO_MESSAGE_TYPE = {
     "image": MessageType.PHOTO,
@@ -293,6 +308,10 @@ class FmsgAdapter(BasePlatformAdapter):
         # normalised chat_id -> last 1:1 DM message id (either direction).
         # Used so agent-initiated home/cron pings continue the existing thread.
         self._last_by_chat: Dict[str, int] = {}
+        # Branch sessions: parent_id -> child message ids (order of discovery).
+        self._children: Dict[int, List[int]] = {}
+        # message id -> Hermes thread_id / branch key for that message.
+        self._msg_branch: Dict[int, str] = {}
         self._last_seen_id: int = 0
         self._state_path = Path(
             os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))
@@ -459,6 +478,11 @@ class FmsgAdapter(BasePlatformAdapter):
 
         root_id, topic = await self._resolve_thread_root(msg_id, msg)
         pid = msg.get("pid") if msg.get("has_pid") or msg.get("pid") else None
+        # Ensure parent has a branch key before assigning this message.
+        if pid and pid not in self._msg_branch:
+            self._msg_branch[pid] = str(root_id)
+        branch_key, is_fork = self._assign_branch_key(msg_id, pid, root_id)
+        self._save_state()
 
         participants = self._remember_participants(msg_id, msg)
 
@@ -468,13 +492,22 @@ class FmsgAdapter(BasePlatformAdapter):
             chat_type="dm",
             user_id=sender,
             user_name=sender.lstrip("@").split("@")[0],
-            thread_id=str(root_id),
+            thread_id=branch_key,
             chat_topic=topic,
             message_id=str(msg_id),
         )
 
-        metadata: Dict[str, Any] = {}
+        metadata: Dict[str, Any] = {
+            "fmsg_root_id": root_id,
+            "fmsg_branch_key": branch_key,
+            "fmsg_is_fork": is_fork,
+        }
         context_notes: List[str] = []
+        if is_fork:
+            ancestry = await self._ancestry_chain(msg_id, msg)
+            ancestry_ctx = await self._format_ancestry_context(ancestry)
+            if ancestry_ctx:
+                context_notes.append(ancestry_ctx)
         if msg.get("important"):
             metadata["important"] = True
             context_notes.append("[the sender marked this fmsg message as important]")
@@ -525,7 +558,7 @@ class FmsgAdapter(BasePlatformAdapter):
             timestamp=timestamp,
         )
 
-        thread_key = (sender, str(root_id))
+        thread_key = (sender, branch_key)
         self._last_inbound[thread_key] = msg_id
         # New user message starts a new agent turn — do not keep chaining
         # to the previous outbound.
@@ -625,6 +658,105 @@ class FmsgAdapter(BasePlatformAdapter):
         self._thread_roots[current] = root
         return root
 
+    async def _ancestry_chain(
+        self, msg_id: int, msg: Dict[str, Any]
+    ) -> List[Tuple[int, Dict[str, Any]]]:
+        """Return [(id, msg), ...] from root → current message inclusive."""
+        chain_rev: List[Tuple[int, Dict[str, Any]]] = [(msg_id, msg)]
+        current = msg
+        seen = {msg_id}
+        while True:
+            pid = current.get("pid") if current.get("has_pid") or current.get("pid") else None
+            if not pid or pid in seen:
+                break
+            seen.add(pid)
+            try:
+                parent = await self._client.get_message(pid) if self._client else None
+            except FmsgApiError as e:
+                logger.debug("[%s] ancestry walk stopped at %s: %s", self.name, pid, e)
+                break
+            if not parent:
+                break
+            chain_rev.append((pid, parent))
+            current = parent
+        chain_rev.reverse()
+        return chain_rev
+
+    def _assign_branch_key(
+        self, msg_id: int, pid: Optional[int], root_id: int
+    ) -> Tuple[str, bool]:
+        """Map message to a Hermes session thread_id; detect forks.
+
+        First child of a parent continues the parent's branch (usually the
+        root id). A later sibling forks: new key ``{root}:br:{msg_id}``.
+
+        Returns ``(branch_key, is_fork)``.
+        """
+        if msg_id in self._msg_branch:
+            parent_key = self._msg_branch.get(pid) if pid else None
+            key = self._msg_branch[msg_id]
+            return key, bool(pid and parent_key and key != parent_key)
+
+        if not pid:
+            key = str(root_id)
+            self._msg_branch[msg_id] = key
+            return key, False
+
+        parent_key = self._msg_branch.get(pid) or str(root_id)
+        kids = self._children.setdefault(pid, [])
+        prior = [c for c in kids if c != msg_id]
+        if not prior:
+            # First discovered child continues the parent session.
+            if msg_id not in kids:
+                kids.append(msg_id)
+            self._msg_branch[msg_id] = parent_key
+            self._msg_branch.setdefault(pid, parent_key)
+            return parent_key, False
+
+        # Fork: parent already has another child.
+        if msg_id not in kids:
+            kids.append(msg_id)
+        key = f"{root_id}:br:{msg_id}"
+        self._msg_branch[msg_id] = key
+        self._msg_branch.setdefault(pid, parent_key)
+        return key, True
+
+    async def _format_ancestry_context(
+        self, ancestry: List[Tuple[int, Dict[str, Any]]]
+    ) -> str:
+        """Build channel_context from root → parent (exclude current leaf)."""
+        if len(ancestry) <= 1:
+            return ""
+        lines = [
+            "[fmsg branch context — direct ancestry only (root → parent); "
+            "sibling branches are not included. This is a forked path of the "
+            "fmsg tree, hydrated like a session branch rather than a blank chat.]"
+        ]
+        used = 0
+        # Exclude the current message (last entry); show ancestors only.
+        ancestors = ancestry[:-1][-MAX_ANCESTRY_CONTEXT_MSGS:]
+        for mid, amsg in ancestors:
+            try:
+                body = await self._message_text(mid, amsg)
+            except FmsgApiError:
+                body = (amsg.get("short_text") or "").strip()
+            body = (body or "").strip()
+            if len(body) > 500:
+                body = body[:500] + "…"
+            frm = amsg.get("from") or "?"
+            topic = amsg.get("topic")
+            head = f"[id={mid} from={frm}"
+            if topic:
+                head += f" topic={topic}"
+            head += "]"
+            chunk = f"{head} {body}" if body else head
+            if used + len(chunk) + 1 > MAX_ANCESTRY_CONTEXT_CHARS:
+                lines.append("[…ancestry truncated…]")
+                break
+            lines.append(chunk)
+            used += len(chunk) + 1
+        return "\n".join(lines)
+
     def _remember_participants(self, msg_id: int, msg: Dict[str, Any]) -> List[str]:
         """Cache participants of this message (keyed by message id)."""
         parts = participants_from_msg(msg)
@@ -713,18 +845,60 @@ class FmsgAdapter(BasePlatformAdapter):
                         self._last_by_chat[_norm_addr(k)] = int(v)
                     except (TypeError, ValueError):
                         continue
+            self._msg_branch = {}
+            raw_branch = state.get("msg_branch") or {}
+            if isinstance(raw_branch, dict):
+                for k, v in raw_branch.items():
+                    try:
+                        self._msg_branch[int(k)] = str(v)
+                    except (TypeError, ValueError):
+                        continue
+            self._children = {}
+            raw_children = state.get("children") or {}
+            if isinstance(raw_children, dict):
+                for k, v in raw_children.items():
+                    try:
+                        parent = int(k)
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(v, list):
+                        continue
+                    kids: List[int] = []
+                    for item in v:
+                        try:
+                            kids.append(int(item))
+                        except (TypeError, ValueError):
+                            continue
+                    if kids:
+                        self._children[parent] = kids
         except (OSError, ValueError, json.JSONDecodeError):
             self._last_seen_id = 0
             self._last_by_chat = {}
+            self._msg_branch = {}
+            self._children = {}
 
     def _save_state(self) -> None:
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            # Cap branch maps so the state file cannot grow without bound.
+            max_branch = 500
+            msg_branch = self._msg_branch
+            children = self._children
+            if len(msg_branch) > max_branch:
+                keep_ids = set(sorted(msg_branch.keys())[-max_branch:])
+                msg_branch = {k: v for k, v in msg_branch.items() if k in keep_ids}
+                children = {
+                    p: [c for c in kids if c in keep_ids or p in keep_ids]
+                    for p, kids in children.items()
+                    if p in keep_ids or any(c in keep_ids for c in kids)
+                }
             self._state_path.write_text(
                 json.dumps(
                     {
                         "last_seen_id": self._last_seen_id,
                         "last_by_chat": self._last_by_chat,
+                        "msg_branch": {str(k): v for k, v in msg_branch.items()},
+                        "children": {str(k): v for k, v in children.items()},
                     }
                 )
             )
@@ -841,6 +1015,28 @@ class FmsgAdapter(BasePlatformAdapter):
         self._msg_participants[str(message_id)] = _merge_addrs(
             [own] if own else [], recipients
         )
+        # Keep branch maps coherent for replies to our own messages.
+        if pid is None:
+            self._msg_branch[message_id] = str(message_id)
+        else:
+            if pid not in self._msg_branch:
+                # Prefer the Hermes thread we are already in.
+                self._msg_branch[pid] = (
+                    str(thread_id) if thread_id is not None else str(pid)
+                )
+            # Root id is used only when minting a fork key "{root}:br:{msg}".
+            root_i = pid
+            if pid in self._thread_roots:
+                root_i = self._thread_roots[pid][0]
+            elif isinstance(thread_id, str) and ":br:" in thread_id:
+                try:
+                    root_i = int(thread_id.split(":br:", 1)[0])
+                except ValueError:
+                    root_i = pid
+            elif str(thread_id or "").isdigit():
+                root_i = int(thread_id)
+            self._assign_branch_key(message_id, pid, root_i)
+        self._save_state()
         # Pure 1:1 outbound → remember for the next agent-initiated ping.
         if len(recipients) == 1 and _norm_addr(recipients[0]) == _norm_addr(chat_id):
             self._note_chat_message(chat_id, message_id)
