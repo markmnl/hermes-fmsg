@@ -75,8 +75,14 @@ Environment variables win over `config.yaml`.
 
 
 Within a thread, the first agent reply sets `pid` to the latest inbound; further agent messages in the same turn chain to the previous outbound (so multi-chunk answers form a line, not siblings of the user prompt). A new inbound resets the chain.
-Agent-initiated messages (cron jobs, notifications) open a new root thread
-with `FMSG_DEFAULT_TOPIC`.
+
+Agent-initiated messages with no `reply_to` / `thread_id` (gateway
+home-channel online/offline notices, cron without a thread) **continue the
+latest 1:1 DM** with that address instead of opening a new root every time.
+After a restart the adapter looks up recent inbox + sent messages to find
+that parent. Force a fresh root with metadata `fmsg_new_thread=true`
+(optional `topic` override; default `FMSG_DEFAULT_TOPIC`). Multi-party
+parents are never chosen for this auto-continue path.
 
 ### Multi-party / reply-all
 
@@ -90,7 +96,8 @@ reason not to (e.g. privately warning others about a malicious participant).
 | Reply to a DM parent | that counterparty |
 | Reply to a multi-party parent | all other participants on **that** parent |
 | Reply to a later 1:1 message in a group thread | only that message’s participants (not the whole history) |
-| New root (cron / no `pid`) | single target (home / chat_id) |
+| New root (`fmsg_new_thread` or no prior DM) | single target (home / chat_id) |
+| Agent-initiated continue of existing 1:1 DM | that counterparty |
 | Metadata `fmsg_reply_all=false` | counterparty only (exceptional) |
 | Metadata `fmsg_to` / `recipients` | explicit list (self stripped; exceptional subset) |
 

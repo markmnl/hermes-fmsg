@@ -319,6 +319,16 @@ class FakeWebAPI:
             ]
             return httpx.Response(200, json=inbox[offset:offset + limit])
 
+        if method == "GET" and path == "/fmsg/sent":
+            limit = int(request.url.params.get("limit", 20))
+            offset = int(request.url.params.get("offset", 0))
+            sent = [
+                self._public(m)
+                for m in sorted(self.messages.values(), key=lambda m: -m["id"])
+                if m["from"] == self.address and m["_sent"]
+            ]
+            return httpx.Response(200, json=sent[offset:offset + limit])
+
         if method == "POST" and path == "/fmsg":
             body = json.loads(request.content)
             if body.get("pid") is not None and body.get("topic") is not None:

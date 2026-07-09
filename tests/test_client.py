@@ -66,6 +66,15 @@ async def test_list_messages_only_inbox(client, fake_api):
     assert "_data" not in msgs[0]
 
 
+async def test_list_sent_only_authored(client, fake_api):
+    fake_api.seed_message(USER, [BOT_ADDRESS], "inbound")
+    out_id = fake_api.seed_message(BOT_ADDRESS, [USER], "outbound")
+    sent = await client.list_sent()
+    assert len(sent) == 1
+    assert sent[0]["id"] == out_id
+    assert sent[0]["short_text"] == "outbound"
+
+
 async def test_api_error_carries_status(client, fake_api):
     with pytest.raises(FmsgApiError) as exc:
         await client.get_message(999)
