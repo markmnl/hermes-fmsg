@@ -1,0 +1,38 @@
+name: Compatibility result
+description: Report a successful or unsuccessful environment test
+title: "[compat] "
+labels: [compatibility]
+body:
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: hermes-fmsg, Hermes Agent, Python, and operating system
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options: [Hosted fmsg provider, Self-hosted fmsg]
+    validations:
+      required: true
+  - type: input
+    id: time
+    attributes:
+      label: Approximate time to first message
+  - type: checkboxes
+    id: paths
+    attributes:
+      label: Paths verified
+      options:
+        - label: Native Hermes installation
+        - label: Inbound message
+        - label: Outbound reply
+        - label: Thread or branch
+        - label: Attachment
+        - label: Restart catch-up
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes or friction

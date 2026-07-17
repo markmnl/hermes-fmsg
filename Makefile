@@ -1,4 +1,4 @@
-PLUGIN_DIR ?= $(HOME)/.hermes/plugins/fmsg
+PLUGIN_DIR ?= $(HOME)/.hermes/plugins/fmsg-platform
 
 .PHONY: install uninstall test
 
