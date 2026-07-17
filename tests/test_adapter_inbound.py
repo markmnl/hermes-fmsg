@@ -1,8 +1,30 @@
 """FmsgAdapter inbound: event mapping, threading, dedupe, read receipts, catch-up."""
 
+from datetime import datetime, timedelta, timezone
+
+from plugin.adapter import websocket_rotation_delay
+
 from tests.conftest import BOT_ADDRESS
 
 USER = "@bob@example.com"
+
+
+def test_websocket_rotation_uses_full_window_for_long_lived_token():
+    now = datetime(2026, 7, 17, tzinfo=timezone.utc)
+    expires = now + timedelta(hours=12)
+    assert websocket_rotation_delay(expires, now=now) == 11 * 3600 + 55 * 60
+
+
+def test_websocket_rotation_scales_margin_for_ten_minute_token():
+    now = datetime(2026, 7, 17, tzinfo=timezone.utc)
+    expires = now + timedelta(minutes=10)
+    assert websocket_rotation_delay(expires, now=now) == 9 * 60
+
+
+def test_websocket_rotation_has_short_token_floor():
+    now = datetime(2026, 7, 17, tzinfo=timezone.utc)
+    expires = now + timedelta(seconds=20)
+    assert websocket_rotation_delay(expires, now=now) == 30
 
 
 async def _prime(adapter):

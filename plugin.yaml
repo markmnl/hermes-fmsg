@@ -1,0 +1,41 @@
+name: fmsg-platform
+label: fmsg
+kind: platform
+version: 0.1.0
+description: >
+  fmsg platform adapter for Hermes Agent. Real-time inbound over the
+  fmsg-webapi WebSocket (/fmsg/ws), outbound via its JSON REST routes.
+  Authenticates with an fmsg API key (fmsgk_...) exchanged for a
+  short-lived JWT — run the agent as a derived sub-account such as
+  @alice_hermes@example.com. Only httpx + websockets, no SDK.
+author: markmnl
+requires_env:
+  - name: FMSG_API_URL
+    description: "Base URL of fmsg-webapi (e.g. https://fmsgapi.example.com)"
+    prompt: "fmsg API URL"
+    password: false
+  - name: FMSG_API_KEY
+    description: "fmsg API key (fmsgk_<key_id>_<secret>) for the agent's sub-account"
+    prompt: "fmsg API key"
+    password: true
+optional_env:
+  - name: FMSG_ALLOWED_USERS
+    description: "Comma-separated fmsg addresses allowed to talk to the agent (@user@domain)"
+    prompt: "Allowed fmsg addresses (comma-separated)"
+    password: false
+  - name: FMSG_ALLOW_ALL_USERS
+    description: "Allow any fmsg address to talk to the agent (dev only — disables allowlist)"
+    prompt: "Allow all senders? (true/false)"
+    password: false
+  - name: FMSG_HOME_CHANNEL
+    description: "fmsg address for cron / notification delivery (usually the owner)"
+    prompt: "Home channel address (or empty)"
+    password: false
+  - name: FMSG_HOME_CHANNEL_NAME
+    description: "Human label for the home channel (defaults to the address)"
+    prompt: "Home channel display name (or empty)"
+    password: false
+  - name: FMSG_DEFAULT_TOPIC
+    description: "Topic for agent-initiated root messages (default: Hermes)"
+    prompt: "Default thread topic (or empty)"
+    password: false

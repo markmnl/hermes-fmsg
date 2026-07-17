@@ -106,7 +106,7 @@ try:
         FmsgAuthError,
         FmsgClient,
         TokenManager,
-        TOKEN_REFRESH_BEFORE,
+TOKEN_REFRESH_BEFORE,
     )
 except ImportError:  # loaded outside a package context
     import importlib.util as _ilu
@@ -130,6 +130,8 @@ MAX_MESSAGE_LENGTH = 65536
 MAX_ATTACH_BYTES = 10 * 1024 * 1024  # FMSG_API_MAX_ATTACH_SIZE default
 DEDUP_MAX_SIZE = 1000
 RECONNECT_BACKOFF_MAX = 60.0
+CLOSE_BEFORE_EXPIRY_MIN_SECONDS = 30.0
+MIN_WS_CONNECTION_SECONDS = 30.0
 CATCHUP_PAGE_LIMIT = 100
 FIRST_RUN_CATCHUP_MAX = 50  # unread backlog cap on a brand-new install
 # Cap ancestry hydration injected into channel_context on a branch fork.
@@ -151,6 +153,27 @@ def _extra_or_env(extra: Dict[str, Any], key: str, env: str, default: str = "") 
 def _norm_addr(addr: str) -> str:
     """Case-fold an fmsg address for equality (Unicode default case folding)."""
     return (addr or "").strip().casefold()
+
+
+def websocket_rotation_delay(
+    expires_at: datetime,
+    *,
+    now: Optional[datetime] = None,
+) -> float:
+    """Seconds to keep a WebSocket before reconnecting with a fresh JWT.
+
+    Use the normal five-minute refresh window for long-lived tokens, but scale
+    the margin down for short-lived tokens. Subtracting a fixed ten minutes
+    caused ten-minute deployments to reconnect every minute without gaining a
+    fresher token.
+    """
+    current = now or datetime.now(timezone.utc)
+    remaining = max((expires_at - current).total_seconds(), 0.0)
+    refresh_margin = min(
+        TOKEN_REFRESH_BEFORE.total_seconds(),
+        max(CLOSE_BEFORE_EXPIRY_MIN_SECONDS, remaining * 0.1),
+    )
+    return max(remaining - refresh_margin, MIN_WS_CONNECTION_SECONDS)
 
 
 def _merge_addrs(*groups: Any) -> List[str]:
@@ -396,10 +419,9 @@ class FmsgAdapter(BasePlatformAdapter):
         in-band)."""
         deadline = None
         if self._tokens.expires_at is not None:
-            remaining = (
-                self._tokens.expires_at - datetime.now(timezone.utc)
-            ).total_seconds() - 2 * TOKEN_REFRESH_BEFORE.total_seconds()
-            deadline = time.monotonic() + max(remaining, 60.0)
+            deadline = time.monotonic() + websocket_rotation_delay(
+                self._tokens.expires_at
+            )
 
         agen = self._client.iter_events()
         try:
@@ -1405,8 +1427,11 @@ def register(ctx) -> None:
             "Messages are plain text (markdown renders client-dependent); files "
             "travel as attachments. Conversations are threaded: a root message "
             "carries a topic and replies chain to their parent. Addresses look "
-            "like @user@example.com. Replies default to all participants of the message you are replying to (reply-all on that parent). Only omit someone in exceptional cases (e.g. privately warning others about malicious behaviour) — normal group answers should keep everyone. When you send multiple messages in one turn they chain (each replies to the previous), not all to the same user prompt."
-            "participants by default (reply-all); you do not need a special tool "
-            "for that."
+            "like @user@example.com. Replies default to all participants of the "
+            "message you are replying to (reply-all on that parent). Only omit "
+            "someone in exceptional cases (e.g. privately warning others about "
+            "malicious behaviour); normal group answers should keep everyone. "
+            "When you send multiple messages in one turn they chain (each replies "
+            "to the previous), not all to the same user prompt."
         ),
     )
