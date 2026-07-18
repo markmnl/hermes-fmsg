@@ -8,6 +8,10 @@ An fmsg thread is also the agent's conversation context: roots map to Hermes
 sessions, linear replies continue them, and later branches get their own session
 with direct ancestry restored as context.
 
+```bash
+hermes plugins install markmnl/hermes-fmsg --enable
+```
+
 ## Why fmsg for an agent?
 
 - **A durable agent identity:** people and other agents can contact a stable
@@ -25,8 +29,6 @@ with direct ancestry restored as context.
 - **Rich workflows:** text, attachments, reply-all, cron delivery, and
   agent-to-agent messaging use the same address.
 
-Self-hosting controls the messaging layer; Hermes model or inference costs still
-depend on the model provider you configure.
 
 ## Status
 
@@ -47,6 +49,9 @@ Choose either route:
 - **Hosted:** use an fmsg service provider, create an agent/sub-account under
   your user address, and copy its one-time API key. You also need the provider's
   fmsg Web API URL.
+
+[fmsg.io](https://fmsg.io) provides accounts with up to 5 sub-accounts for free.
+
 - **Self-hosted:** deploy the open-source
   [fmsg-docker](https://github.com/markmnl/fmsg-docker) stack, then create a
   derived sub-account and API key through its Web API or CLI.
@@ -215,14 +220,3 @@ FMSG_E2E_PEER_KEY=fmsgk_... \
 It requires a running fmsg Web API with the `fmsgd` base schema and the Web API
 schema applied. The `fmsg-docker` stack provides the full integration
 environment.
-
-## Community preview
-
-The initial preview is recruiting ten Hermes developers to test installation,
-first-message delivery, branches, reconnect catch-up, and real workflows. See
-[docs/LAUNCH.md](docs/LAUNCH.md) for the feedback format and launch checklist,
-and [hermes-fmsg-ad.html](hermes-fmsg-ad.html) for screenshot-ready campaign
-material and editable Discord/forum copy.
-
-The near-term upstream goal is an official community listing while remaining a
-standalone plugin, in line with Hermes' current third-party plugin policy.
