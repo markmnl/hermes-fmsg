@@ -1449,9 +1449,12 @@ def register(ctx) -> None:
             "or invent a separate from address. For a direct plugin send, pass the "
             "recipient's complete fmsg address (for example @alice@example.com) "
             "verbatim as chat_id, without an fmsg: prefix. Hermes Agent 0.18.x "
-            "does not parse fmsg:<address> as an explicit `hermes send --to` target. "
-            "For that CLI, use the bare fmsg platform with FMSG_HOME_CHANNEL, or "
-            "reply in an existing fmsg conversation; do not report that an explicit "
-            "fmsg:<address> CLI target will work."
+            "does not parse fmsg:<address> as an explicit `hermes send --to` target; "
+            "this is only a CLI resolver limitation. Use the bare fmsg platform with "
+            "FMSG_HOME_CHANNEL or reply in-thread. To initiate a message to another "
+            "address programmatically, use FMSG_API_URL and FMSG_API_KEY without "
+            "revealing them: POST /fmsg/token, use the JWT subject as `from`, POST a "
+            "draft to /fmsg, then POST /fmsg/{id}/send. The same JWT may call other "
+            "fmsg Web API routes allowed for its identity."
         ),
     )
