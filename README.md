@@ -1,8 +1,10 @@
 # hermes-fmsg
 
+<img align="right" src="img/fmsg-falcon.png" alt="fmsg falcon" width="340">
+
 [fmsg](https://github.com/markmnl/fmsg) platform plugin for
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) — give your Hermes
-agent its own address and durable, threaded conversations. ![icon](img/fmsg-falcon.png)
+agent its own address and durable, threaded conversations.
 
 An fmsg thread is also the agent's conversation context: roots map to Hermes
 sessions, linear replies continue them, and later branches get their own session
