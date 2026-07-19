@@ -35,19 +35,20 @@ hermes plugins install markmnl/hermes-fmsg --enable
   short-lived JWTs, rather than a human password or persistent user token.
 - **Federated reach:** addresses on independently operated fmsg hosts can
   communicate without joining the same messaging silo.
-- **Operator control:** self-host the messaging service and choose storage,
-  quotas, retention, and policy without per-message platform metering.
+- **Self Hostable:** self-host an fmsg host on your domain and choose storage,
+  quotas, retention, and policy without per-message platform metering. Your
+  messages are handled by you ensuring data sovereignty and privacy.
 - **Rich workflows:** text, attachments, reply-all, cron delivery, and
   agent-to-agent messaging use the same address.
 
 
 ## Status
 
-Developer preview (`0.1.0`). The core message, attachment, reconnect, auth,
+Developer preview (`v0.1.1`). The core message, attachment, reconnect, auth,
 threading, and branching paths are implemented and unit tested. The plugin is a
 standalone community integration, not bundled with Hermes Agent.
 
-Tested with Hermes Agent `0.18.2`. Please report compatibility problems with
+Tested with Hermes Agent `v0.18.2`. Please report compatibility problems with
 your Hermes version and operating system.
 
 ## Quickstart
@@ -77,30 +78,41 @@ hermes plugins install markmnl/hermes-fmsg --enable
 
 The Hermes installer prompts for:
 
-- `FMSG_API_URL` — the base URL of the host's fmsg Web API.
+- `FMSG_API_URL` — the base URL of the host's fmsg Web API; the plugin uses
+  `https://api.fmsg.io` when it is left unset.
 - `FMSG_API_KEY` — the agent's `fmsgk_...` API key.
+
+Hermes skips an install prompt when the variable is already present in either
+the current process environment or `~/.hermes/.env`.
 
 The repository root is a native Hermes plugin package; cloning or copying files
 manually is not required.
 
-### 3. Allow trusted senders
+### 3. Configure the environment
 
-Add at least one address to `~/.hermes/.env`:
+Here are the FMSG_ env vars this plugin can use:
 
 ```dotenv
+# Required
+FMSG_API_KEY=fmsgk_<key_id>_<secret>
+FMSG_API_URL=https://api.fmsg.io
+
+# Access control: allow one or more trusted fmsg addresses
 FMSG_ALLOWED_USERS=@alice@example.com,@bob@example.com
-```
+FMSG_ALLOW_ALL_USERS=false
 
-The default is deny. `FMSG_ALLOW_ALL_USERS=true` bypasses the allowlist and is
-intended only for isolated development.
-
-Optional settings:
-
-```dotenv
+# Cron and notification delivery; normally use your own fmsg address
 FMSG_HOME_CHANNEL=@alice@example.com
 FMSG_HOME_CHANNEL_NAME=Alice
+
+# Topic for agent-initiated conversations
 FMSG_DEFAULT_TOPIC=Hermes
 ```
+
+At least one trusted address is recommended. The default is deny;
+`FMSG_ALLOW_ALL_USERS=true` bypasses the allowlist and is intended only for
+isolated development. `FMSG_HOME_CHANNEL` is optional and should normally be
+the plugin owner's own fmsg address.
 
 Environment variables take precedence over `platforms.fmsg.extra` in
 `~/.hermes/config.yaml`.
@@ -116,6 +128,37 @@ hermes plugins list --plain --no-bundled
 The plugin list should show `fmsg-platform` enabled and the gateway log should
 show `fmsg connected`. Send a message to the agent's address to open its first
 Hermes session.
+
+### Sending messages from Hermes
+
+The sending identity is the fmsg sub-account bound to `FMSG_API_KEY`. The
+plugin obtains that address from the exchanged JWT and supplies it as the
+message's `from` address; do not configure a separate sender address.
+
+With `FMSG_HOME_CHANNEL` set, an agent or shell command can send to that
+address using the platform-only target:
+
+```bash
+hermes send --to fmsg "whats up"
+```
+
+Replies in an existing fmsg conversation automatically use that
+conversation's address and thread. Code calling the plugin sender directly
+must pass the recipient's complete fmsg address, such as
+`@alice@example.com`, as `chat_id` without an `fmsg:` prefix.
+
+Hermes Agent 0.18.x does not recognize an fmsg address as an explicit
+`hermes send` target. Consequently, this form currently fails in Hermes target
+resolution even though the plugin can send to the address:
+
+```bash
+hermes send --to 'fmsg:@alice@example.com' "whats up"
+```
+
+Use the configured home channel, reply in-thread, or call the plugin sender
+directly until Hermes adds native fmsg-address target parsing. A directory
+entry such as `@alice@example.com:255` includes a thread identifier and should
+not be mistaken for a bare fmsg address.
 
 ## How conversations map to Hermes
 

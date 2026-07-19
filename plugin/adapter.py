@@ -19,7 +19,8 @@ Configuration in config.yaml::
 Environment variables (env wins over config.yaml ``extra``; names match
 fmsg-cli so one .env can drive both):
 
-    FMSG_API_URL            Base URL of fmsg-webapi (required)
+    FMSG_API_URL            Base URL of fmsg-webapi
+                            (default "https://api.fmsg.io")
     FMSG_API_KEY            API key fmsgk_<key_id>_<secret> (required)
     FMSG_ALLOWED_USERS      Comma-separated @user@domain allowlist
     FMSG_ALLOW_ALL_USERS    Allow any sender — dev only
@@ -129,6 +130,7 @@ except ImportError:  # loaded outside a package context
 logger = logging.getLogger(__name__)
 
 DEFAULT_TOPIC = "Hermes"
+DEFAULT_API_URL = "https://api.fmsg.io"
 # Well under the webapi's 10 MB body cap; keeps single messages readable.
 MAX_MESSAGE_LENGTH = 65536
 MAX_ATTACH_BYTES = 10 * 1024 * 1024  # FMSG_API_MAX_ATTACH_SIZE default
@@ -288,12 +290,14 @@ def check_requirements() -> bool:
     """Installable and minimally configured (deps + required env)."""
     if not (HTTPX_AVAILABLE and WEBSOCKETS_AVAILABLE):
         return False
-    return bool(os.getenv("FMSG_API_URL", "").strip() and os.getenv("FMSG_API_KEY", "").strip())
+    return bool(os.getenv("FMSG_API_KEY", "").strip())
 
 
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
-    api_url = extra.get("api_url") or os.getenv("FMSG_API_URL", "")
+    api_url = (
+        extra.get("api_url") or os.getenv("FMSG_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    )
     api_key = extra.get("api_key") or os.getenv("FMSG_API_KEY", "")
     return bool(api_url and api_key)
 
@@ -312,7 +316,9 @@ class FmsgAdapter(BasePlatformAdapter):
         super().__init__(config=config, platform=Platform("fmsg"))
 
         extra = config.extra or {}
-        self._api_url = _extra_or_env(extra, "api_url", "FMSG_API_URL").rstrip("/")
+        self._api_url = _extra_or_env(
+            extra, "api_url", "FMSG_API_URL", DEFAULT_API_URL
+        ).rstrip("/")
         self._api_key = _extra_or_env(extra, "api_key", "FMSG_API_KEY")
         self._default_topic = (
             _extra_or_env(extra, "default_topic", "FMSG_DEFAULT_TOPIC") or DEFAULT_TOPIC
@@ -353,7 +359,7 @@ class FmsgAdapter(BasePlatformAdapter):
             )
             return False
         if not (self._api_url and self._api_key):
-            logger.warning("[%s] FMSG_API_URL / FMSG_API_KEY not configured", self.name)
+            logger.warning("[%s] FMSG_API_KEY not configured", self.name)
             return False
 
         self._tokens = TokenManager(self._api_url, self._api_key)
@@ -1289,9 +1295,9 @@ class FmsgAdapter(BasePlatformAdapter):
 
 def _env_enablement() -> Optional[dict]:
     """Seed PlatformConfig.extra from env so env-only setups auto-enable."""
-    api_url = os.getenv("FMSG_API_URL", "").strip()
+    api_url = os.getenv("FMSG_API_URL", DEFAULT_API_URL).strip() or DEFAULT_API_URL
     api_key = os.getenv("FMSG_API_KEY", "").strip()
-    if not (api_url and api_key):
+    if not api_key:
         return None
     seed: dict = {"api_url": api_url.rstrip("/"), "api_key": api_key}
     default_topic = os.getenv("FMSG_DEFAULT_TOPIC", "").strip()
@@ -1319,10 +1325,12 @@ async def _standalone_send(
     if not HTTPX_AVAILABLE:
         return {"error": "fmsg standalone send: httpx not installed"}
     extra = getattr(pconfig, "extra", {}) or {}
-    api_url = (extra.get("api_url") or os.getenv("FMSG_API_URL", "")).strip().rstrip("/")
+    api_url = (
+        extra.get("api_url") or os.getenv("FMSG_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+    ).strip().rstrip("/")
     api_key = (extra.get("api_key") or os.getenv("FMSG_API_KEY", "")).strip()
-    if not (api_url and api_key):
-        return {"error": "fmsg standalone send: FMSG_API_URL / FMSG_API_KEY not configured"}
+    if not api_key:
+        return {"error": "fmsg standalone send: FMSG_API_KEY not configured"}
     if not chat_id:
         return {"error": "fmsg standalone send: no recipient address"}
 
@@ -1436,6 +1444,14 @@ def register(ctx) -> None:
             "someone in exceptional cases (e.g. privately warning others about "
             "malicious behaviour); normal group answers should keep everyone. "
             "When you send multiple messages in one turn they chain (each replies "
-            "to the previous), not all to the same user prompt."
+            "to the previous), not all to the same user prompt. The authenticated "
+            "sender address comes from the API key's exchanged JWT; never ask for "
+            "or invent a separate from address. For a direct plugin send, pass the "
+            "recipient's complete fmsg address (for example @alice@example.com) "
+            "verbatim as chat_id, without an fmsg: prefix. Hermes Agent 0.18.x "
+            "does not parse fmsg:<address> as an explicit `hermes send --to` target. "
+            "For that CLI, use the bare fmsg platform with FMSG_HOME_CHANNEL, or "
+            "reply in an existing fmsg conversation; do not report that an explicit "
+            "fmsg:<address> CLI target will work."
         ),
     )
