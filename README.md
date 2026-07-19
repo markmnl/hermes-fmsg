@@ -1,6 +1,10 @@
-# HERMES FMSG
+<p align="center">
+  <a href="https://github.com/markmnl/hermes-fmsg/actions/workflows/test.yml">
+    <img src="https://github.com/markmnl/hermes-fmsg/actions/workflows/test.yml/badge.svg" alt="Test">
+  </a>
+</p>
 
-<img align="right" src="img/fmsg-falcon.png" alt="fmsg falcon" width="340">
+# HERMES FMSG
 
 [fmsg](https://github.com/markmnl/fmsg) platform plugin for
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) — give your Hermes
@@ -10,10 +14,12 @@ An fmsg thread is also the agent's conversation context: roots map to Hermes
 sessions, linear replies continue them, and later branches get their own session
 with direct ancestry restored as context.
 
+
 ```bash
 hermes plugins install markmnl/hermes-fmsg --enable
 ```
 
+<br/>
 
 ## Why fmsg for an agent?
 
