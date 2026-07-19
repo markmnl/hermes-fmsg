@@ -2,7 +2,7 @@
 
 [fmsg](https://github.com/markmnl/fmsg) platform plugin for
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) — give your Hermes
-agent its own address and durable, threaded conversations.
+agent its own address and durable, threaded conversations. ![icon](img/fmsg-falcon.png)
 
 An fmsg thread is also the agent's conversation context: roots map to Hermes
 sessions, linear replies continue them, and later branches get their own session
@@ -36,8 +36,7 @@ Developer preview (`0.1.0`). The core message, attachment, reconnect, auth,
 threading, and branching paths are implemented and unit tested. The plugin is a
 standalone community integration, not bundled with Hermes Agent.
 
-Tested with Hermes Agent `0.18.2`. During the preview, the supported target is
-the current stable Hermes release. Please report compatibility problems with
+Tested with Hermes Agent `0.18.2`. Please report compatibility problems with
 your Hermes version and operating system.
 
 ## Quickstart
