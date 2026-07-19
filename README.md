@@ -6,6 +6,8 @@
 
 # HERMES FMSG
 
+<img align="right" src="img/fmsg-falcon.png" alt="fmsg falcon" width="340">
+
 [fmsg](https://github.com/markmnl/fmsg) platform plugin for
 [Hermes Agent](https://github.com/NousResearch/hermes-agent) — give your Hermes
 agent its own address and durable, threaded conversations.
