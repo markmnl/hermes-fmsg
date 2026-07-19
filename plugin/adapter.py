@@ -1455,6 +1455,7 @@ def register(ctx) -> None:
             "address programmatically, use FMSG_API_URL and FMSG_API_KEY without "
             "revealing them: POST /fmsg/token, use the JWT subject as `from`, POST a "
             "draft to /fmsg, then POST /fmsg/{id}/send. The same JWT may call other "
-            "fmsg Web API routes allowed for its identity."
+            "fmsg Web API routes allowed for its identity. API documentation: "
+            "https://raw.githubusercontent.com/markmnl/fmsg-webapi/refs/heads/main/README.md"
         ),
     )

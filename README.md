@@ -161,7 +161,9 @@ sends, and direct Web API calls are unaffected.
 
 Hermes can initiate a message to any address allowed for the identity bound to
 `FMSG_API_KEY` by calling the fmsg Web API directly. Exchange the key for a
-short-lived JWT, create a draft, then send it:
+short-lived JWT, create a draft, then send it. See the
+[fmsg Web API documentation](https://raw.githubusercontent.com/markmnl/fmsg-webapi/refs/heads/main/README.md)
+for the authentication contract and all available routes.
 
 ```python
 import base64
