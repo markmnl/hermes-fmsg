@@ -65,6 +65,10 @@ home-channel online/offline notices, cron without a thread, etc.) continue
 the latest **1:1 DM** with that chat address instead of opening a new root
 every time. Force a fresh root with metadata ``fmsg_new_thread=true``
 (optional ``topic`` override; default ``FMSG_DEFAULT_TOPIC``).
+
+If reply fails e.g. parent not found, the adapter falls back to a new root
+message (with the same topic as the parent if known). This is a 
+best-effort fallback to avoid losing the agent's output.
 """
 
 import asyncio
