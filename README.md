@@ -1,4 +1,4 @@
-# hermes-fmsg
+# HERMES FMSG
 
 <img align="right" src="img/fmsg-falcon.png" alt="fmsg falcon" width="340">
 
@@ -13,6 +13,7 @@ with direct ancestry restored as context.
 ```bash
 hermes plugins install markmnl/hermes-fmsg --enable
 ```
+
 
 ## Why fmsg for an agent?
 
