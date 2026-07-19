@@ -23,3 +23,12 @@ def test_repository_root_is_a_loadable_plugin_package():
 
 def test_native_and_legacy_manifests_stay_in_sync():
     assert (ROOT / "plugin.yaml").read_bytes() == (ROOT / "plugin" / "plugin.yaml").read_bytes()
+
+
+def test_install_manifest_prompts_for_api_url_with_hosted_default_hint():
+    manifest = (ROOT / "plugin.yaml").read_text()
+
+    assert "  - name: FMSG_API_URL\n" in manifest
+    assert '    prompt: "fmsg API URL [https://api.fmsg.io]"\n' in manifest
+    assert "  - name: FMSG_API_KEY\n" in manifest
+    assert "    secret: true\n" in manifest

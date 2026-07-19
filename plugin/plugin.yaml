@@ -11,13 +11,14 @@ description: >
 author: markmnl
 requires_env:
   - name: FMSG_API_URL
-    description: "Base URL of fmsg-webapi (e.g. https://fmsgapi.example.com)"
-    prompt: "fmsg API URL"
+    description: "Base URL of fmsg-webapi (hosted default: https://api.fmsg.io)"
+    prompt: "fmsg API URL [https://api.fmsg.io]"
     password: false
   - name: FMSG_API_KEY
     description: "fmsg API key (fmsgk_<key_id>_<secret>) for the agent's sub-account"
     prompt: "fmsg API key"
     password: true
+    secret: true
 optional_env:
   - name: FMSG_ALLOWED_USERS
     description: "Comma-separated fmsg addresses allowed to talk to the agent (@user@domain)"

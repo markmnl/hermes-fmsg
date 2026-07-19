@@ -121,6 +121,20 @@ async def test_standalone_send_missing_config(fake_api, monkeypatch):
     assert "error" in result
 
 
+def test_hosted_api_url_is_used_when_not_configured(monkeypatch):
+    import plugin.adapter as adapter_mod
+    from gateway.config import PlatformConfig
+
+    monkeypatch.delenv("FMSG_API_URL", raising=False)
+    monkeypatch.setenv("FMSG_API_KEY", API_KEY)
+
+    adapter = adapter_mod.FmsgAdapter(PlatformConfig(enabled=True, extra={}))
+
+    assert adapter._api_url == "https://api.fmsg.io"
+    assert adapter_mod.check_requirements() is True
+    assert adapter_mod._env_enablement()["api_url"] == "https://api.fmsg.io"
+
+
 LISA = "@lisa@example.com"
 MARK = "@mark@example.com"
 
