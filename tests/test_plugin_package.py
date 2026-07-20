@@ -32,3 +32,10 @@ def test_install_manifest_prompts_for_api_url_with_hosted_default_hint():
     assert '    prompt: "fmsg API URL [https://api.fmsg.io]"\n' in manifest
     assert "  - name: FMSG_API_KEY\n" in manifest
     assert "    secret: true\n" in manifest
+
+
+def test_platform_hint_keeps_api_credentials_inside_adapter():
+    source = (ROOT / "plugin" / "adapter.py").read_text()
+
+    assert "Do not call the fmsg Web API, read FMSG_API_KEY" in source
+    assert "use FMSG_API_URL and FMSG_API_KEY" not in source
