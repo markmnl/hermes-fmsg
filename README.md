@@ -147,6 +147,21 @@ conversation's address and thread. Code calling the plugin sender directly
 must pass the recipient's complete fmsg address, such as
 `@alice@example.com`, as `chat_id` without an `fmsg:` prefix.
 
+Use these integration paths:
+
+- **Current conversation:** reply normally; the live adapter preserves the
+  fmsg parent, recipients, and Hermes session.
+- **Configured home channel:** use `hermes send --to fmsg "message"` or the
+  Hermes `send_message` tool with target `fmsg`.
+- **Cron delivery:** configure `FMSG_HOME_CHANNEL`; Hermes invokes the plugin's
+  registered standalone sender when it is outside the gateway process.
+- **Application code inside Hermes:** call the platform adapter's `send` method
+  with the complete address as `chat_id`.
+
+In all of these paths the plugin owns API-key exchange, sender identity,
+threading, attachments, and error handling. The Hermes agent should not read
+`FMSG_API_KEY`, manage JWTs, or construct fmsg drafts itself.
+
 Hermes Agent 0.18.x does not recognize an fmsg address as an explicit CLI
 target, so this form fails before the request reaches the plugin:
 
@@ -154,14 +169,21 @@ target, so this form fails before the request reaches the plugin:
 hermes send --to 'fmsg:@alice@example.com' "whats up"
 ```
 
-This is only a `hermes send --to` parsing limitation. Replies, home-channel
-sends, and direct Web API calls are unaffected.
+This is only a `hermes send --to` target-resolution limitation: the request
+fails before the fmsg adapter is called. Replies, home-channel sends, and
+direct calls to the platform adapter are unaffected.
 
-### Direct address sends from code
+### Low-level Web API example
 
-Hermes can initiate a message to any address allowed for the identity bound to
-`FMSG_API_KEY` by calling the fmsg Web API directly. Exchange the key for a
-short-lived JWT, create a draft, then send it. See the
+The following example is for external applications, integration debugging, or
+environments where the Hermes plugin cannot be loaded. It is not the
+recommended send path for a Hermes agent: use the live adapter or its
+registered standalone sender instead so threading, recipients, attachments,
+and failures are handled consistently.
+
+An external application can send to any address allowed for the identity bound
+to `FMSG_API_KEY` by exchanging the key for a short-lived JWT, creating a draft,
+and then sending it. See the
 [fmsg Web API documentation](https://raw.githubusercontent.com/markmnl/fmsg-webapi/refs/heads/main/README.md)
 for the authentication contract and all available routes.
 
