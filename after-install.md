@@ -1,8 +1,4 @@
-# fmsg-platform installed
-
-Inbound replies only work when **both** access control and the gateway are set up.
-Outbound `hermes send` can succeed without either of those — that is the common
-first-run footgun.
+# fmsg-platform installed!
 
 ## Required before inbound works
 
@@ -31,7 +27,7 @@ hermes gateway status
 ## Access control
 
 - Prefer a narrow `FMSG_ALLOWED_USERS` list.
-- Do **not** set `FMSG_ALLOW_ALL_USERS=true` on a network-exposed agent.
+- Do **not** set `FMSG_ALLOW_ALL_USERS=true` on a network-exposed agent, unless you want anyone to be able to fmsg your hermes.
 - Add more senders later in `~/.hermes/.env`, then `hermes gateway restart`.
 
 ## Sanity check
