@@ -173,64 +173,6 @@ This is only a `hermes send --to` target-resolution limitation: the request
 fails before the fmsg adapter is called. Replies, home-channel sends, and
 direct calls to the platform adapter are unaffected.
 
-### Low-level Web API example
-
-The following example is for external applications, integration debugging, or
-environments where the Hermes plugin cannot be loaded. It is not the
-recommended send path for a Hermes agent: use the live adapter or its
-registered standalone sender instead so threading, recipients, attachments,
-and failures are handled consistently.
-
-An external application can send to any address allowed for the identity bound
-to `FMSG_API_KEY` by exchanging the key for a short-lived JWT, creating a draft,
-and then sending it. See the
-[fmsg Web API documentation](https://raw.githubusercontent.com/markmnl/fmsg-webapi/refs/heads/main/README.md)
-for the authentication contract and all available routes.
-
-```python
-import base64
-import json
-import os
-
-import httpx
-
-api = os.getenv("FMSG_API_URL", "https://api.fmsg.io").rstrip("/")
-recipient = "@alice@example.com"
-text = "hello from Hermes"
-
-with httpx.Client(timeout=30) as client:
-    response = client.post(
-        f"{api}/fmsg/token",
-        headers={"Authorization": f"Bearer {os.environ['FMSG_API_KEY']}"},
-    )
-    response.raise_for_status()
-    token = response.json()["access_token"]
-    payload = token.split(".")[1]
-    payload += "=" * (-len(payload) % 4)
-    sender = json.loads(base64.urlsafe_b64decode(payload))["sub"]
-    auth = {"Authorization": f"Bearer {token}"}
-    draft = client.post(
-        f"{api}/fmsg",
-        headers=auth,
-        json={
-            "version": 1,
-            "from": sender,
-            "to": [recipient],
-            "type": "text/plain; charset=utf-8",
-            "size": len(text.encode()),
-            "data": text,
-            "topic": "Hermes",
-        },
-    )
-    draft.raise_for_status()
-    message_id = draft.json()["id"]
-    response = client.post(f"{api}/fmsg/{message_id}/send", headers=auth)
-    response.raise_for_status()
-```
-
-The same authentication flow can call any other fmsg Web API route available
-to that identity. Never print or expose the API key or JWT.
-
 ## How conversations map to Hermes
 
 | fmsg | Hermes |
