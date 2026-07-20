@@ -1,7 +1,7 @@
 name: fmsg-platform
 label: fmsg
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
   fmsg platform adapter for Hermes Agent. Real-time inbound over the
   fmsg-webapi WebSocket (/fmsg/ws), outbound via its JSON REST routes.
@@ -19,18 +19,18 @@ requires_env:
     prompt: "fmsg API key"
     password: true
     secret: true
-optional_env:
-  - name: FMSG_ALLOWED_USERS
-    description: "Comma-separated fmsg addresses allowed to talk to the agent (@user@domain)"
-    prompt: "Allowed fmsg addresses (comma-separated)"
+  - name: FMSG_HOME_CHANNEL
+    description: "Your fmsg address (owner). Used for cron/notifications and as the default allowed sender"
+    prompt: "Your fmsg address e.g. @you@example.com"
     password: false
+  - name: FMSG_ALLOWED_USERS
+    description: "Who may message the agent (comma-separated @user@domain). Use your address at minimum"
+    prompt: "Allowed senders (comma-separated; usually same as home)"
+    password: false
+optional_env:
   - name: FMSG_ALLOW_ALL_USERS
     description: "Allow any fmsg address to talk to the agent (dev only — disables allowlist)"
     prompt: "Allow all senders? (true/false)"
-    password: false
-  - name: FMSG_HOME_CHANNEL
-    description: "fmsg address for cron / notification delivery (usually the owner)"
-    prompt: "Home channel address (or empty)"
     password: false
   - name: FMSG_HOME_CHANNEL_NAME
     description: "Human label for the home channel (defaults to the address)"

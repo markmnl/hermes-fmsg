@@ -44,8 +44,10 @@ hermes plugins install markmnl/hermes-fmsg --enable
 
 ## Status
 
-Developer preview (`v0.1.1`). The core message, attachment, reconnect, auth,
-threading, and branching paths are implemented and unit tested. The plugin is a
+Developer preview (`v0.2.0`). The core message, attachment, reconnect, auth,
+threading, and branching paths are implemented and unit tested. Install now
+prompts for home channel + allowlist, and seeds the allowlist from
+`FMSG_HOME_CHANNEL` when the allowlist is left empty. The plugin is a
 standalone community integration, not bundled with Hermes Agent.
 
 Tested with Hermes Agent `v0.18.2`. Please report compatibility problems with
@@ -81,7 +83,14 @@ The Hermes installer prompts for:
 - `FMSG_API_URL` — the base URL of the host's fmsg Web API; the plugin uses
   `https://api.fmsg.io` when it is left unset.
 - `FMSG_API_KEY` — the agent's `fmsgk_...` API key.
+- `FMSG_HOME_CHANNEL` — your owner fmsg address (cron / notifications; also
+  used as the default allowed sender if the allowlist is empty).
+- `FMSG_ALLOWED_USERS` — comma-separated addresses allowed to message the
+  agent (use your address at minimum).
 
+Hermes only prompts variables listed under `requires_env`. Empty answers are
+still skipped, so the plugin also **seeds** `FMSG_ALLOWED_USERS` from
+`FMSG_HOME_CHANNEL` at gateway start when the allowlist is unset (see below).
 Hermes skips an install prompt when the variable is already present in either
 the current process environment or `~/.hermes/.env`.
 
@@ -93,27 +102,31 @@ manually is not required.
 Here are the FMSG_ env vars this plugin can use:
 
 ```dotenv
-# Required
+# Required (prompted at install)
 FMSG_API_KEY=fmsgk_<key_id>_<secret>
 FMSG_API_URL=https://api.fmsg.io
-
-# Access control: allow one or more trusted fmsg addresses
-FMSG_ALLOWED_USERS=@alice@example.com,@bob@example.com
-FMSG_ALLOW_ALL_USERS=false
-
-# Cron and notification delivery; normally use your own fmsg address
 FMSG_HOME_CHANNEL=@alice@example.com
-FMSG_HOME_CHANNEL_NAME=Alice
+FMSG_ALLOWED_USERS=@alice@example.com
 
-# Topic for agent-initiated conversations
+# Optional
+FMSG_ALLOW_ALL_USERS=false
+FMSG_HOME_CHANNEL_NAME=Alice
 FMSG_DEFAULT_TOPIC=Hermes
 ```
 
-At least one trusted address is recommended. The default is deny;
-`FMSG_ALLOW_ALL_USERS=true` bypasses the allowlist and is intended only for
-isolated development. `FMSG_HOME_CHANNEL` is optional and should normally be
-the plugin owner's own fmsg address.
+Access control defaults to **deny**. At least one trusted address is required
+for inbound replies:
 
+- Prefer setting both `FMSG_HOME_CHANNEL` and `FMSG_ALLOWED_USERS` at install.
+- If `FMSG_ALLOWED_USERS` is empty, `FMSG_ALLOW_ALL_USERS` is off, and
+  `FMSG_HOME_CHANNEL` is set, the plugin copies the home channel into the
+  allowlist for the gateway process and logs a warning.
+- If none of those are set, every inbound sender is rejected
+  (`Unauthorized user: ... on fmsg` in the gateway log).
+- `FMSG_ALLOW_ALL_USERS=true` bypasses the allowlist and is intended only for
+  isolated development.
+
+`FMSG_HOME_CHANNEL` should normally be the plugin owner's own fmsg address.
 Environment variables take precedence over `platforms.fmsg.extra` in
 `~/.hermes/config.yaml`.
 
@@ -234,8 +247,12 @@ Common checks:
   environment used by Hermes.
 - **API key rejected:** confirm it is unexpired, unrevoked, allowed from the
   gateway's IP, and belongs to the intended agent address.
-- **Messages ignored:** add the sender to `FMSG_ALLOWED_USERS` and restart the
-  gateway.
+- **Messages ignored / `Unauthorized user` in gateway log:** add the sender to
+  `FMSG_ALLOWED_USERS` (or set `FMSG_HOME_CHANNEL` so the plugin can seed the
+  allowlist) and restart the gateway. Empty allowlist is default-deny.
+- **Outbound works, inbound does not:** `hermes send` uses the standalone
+  sender and does not need a running gateway. Inbound replies need
+  `hermes gateway` with `fmsg connected` in the log.
 - **Connection drops:** the adapter reconnects with backoff and catches up from
   the inbox. Include sanitized `fmsg` lines from the gateway log in a bug report.
 

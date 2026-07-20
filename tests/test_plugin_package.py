@@ -34,6 +34,25 @@ def test_install_manifest_prompts_for_api_url_with_hosted_default_hint():
     assert "    secret: true\n" in manifest
 
 
+def test_install_manifest_prompts_for_home_and_allowlist():
+    """Hermes only prompts requires_env — keep access control there."""
+    manifest = (ROOT / "plugin.yaml").read_text()
+    requires, _, optional = manifest.partition("optional_env:")
+    assert "  - name: FMSG_HOME_CHANNEL\n" in requires
+    assert "  - name: FMSG_ALLOWED_USERS\n" in requires
+    assert "  - name: FMSG_ALLOW_ALL_USERS\n" in optional
+    assert "  - name: FMSG_HOME_CHANNEL_NAME\n" in optional
+    # Home channel itself must not be optional-only.
+    assert "  - name: FMSG_HOME_CHANNEL\n" not in optional
+
+
+def test_after_install_doc_exists():
+    text = (ROOT / "after-install.md").read_text()
+    assert "FMSG_ALLOWED_USERS" in text
+    assert "FMSG_HOME_CHANNEL" in text
+    assert "Unauthorized" in text or "unauthorized" in text.lower()
+
+
 def test_platform_hint_keeps_api_credentials_inside_adapter():
     source = (ROOT / "plugin" / "adapter.py").read_text()
 

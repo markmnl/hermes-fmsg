@@ -22,9 +22,12 @@ fmsg-cli so one .env can drive both):
     FMSG_API_URL            Base URL of fmsg-webapi
                             (default "https://api.fmsg.io")
     FMSG_API_KEY            API key fmsgk_<key_id>_<secret> (required)
-    FMSG_ALLOWED_USERS      Comma-separated @user@domain allowlist
-    FMSG_ALLOW_ALL_USERS    Allow any sender — dev only
     FMSG_HOME_CHANNEL       @user@domain for cron / notification delivery
+                            (install-prompted; also seeds allowlist when
+                            FMSG_ALLOWED_USERS is empty)
+    FMSG_ALLOWED_USERS      Comma-separated @user@domain allowlist
+                            (install-prompted; empty + no allow-all = deny)
+    FMSG_ALLOW_ALL_USERS    Allow any sender — dev only
     FMSG_HOME_CHANNEL_NAME  Human label for the home channel
     FMSG_DEFAULT_TOPIC      Topic for agent-initiated root messages
                             (default "Hermes")
@@ -1293,6 +1296,51 @@ class FmsgAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 
+def _allow_all_enabled() -> bool:
+    return (os.getenv("FMSG_ALLOW_ALL_USERS") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _seed_access_env() -> Optional[str]:
+    """First-run safety for Hermes default-deny allowlists.
+
+    Hermes only prompts ``requires_env`` at install, and empty answers still
+    skip writing the var. An empty ``FMSG_ALLOWED_USERS`` (with allow-all off)
+    silently rejects every inbound sender as unauthorized.
+
+    Behavior:
+    * If allowlist or allow-all is already set → no-op.
+    * Else if ``FMSG_HOME_CHANNEL`` is set → copy it into
+      ``FMSG_ALLOWED_USERS`` for this process (gateway auth reads env).
+    * Else → log an error; inbound will be denied until configured.
+
+    Returns the seeded allowlist value when seeding occurs, else ``None``.
+    """
+    allowed = (os.getenv("FMSG_ALLOWED_USERS") or "").strip()
+    if allowed or _allow_all_enabled():
+        return None
+    home = (os.getenv("FMSG_HOME_CHANNEL") or "").strip()
+    if home:
+        os.environ["FMSG_ALLOWED_USERS"] = home
+        logger.warning(
+            "[Fmsg] FMSG_ALLOWED_USERS unset; defaulting to FMSG_HOME_CHANNEL=%s. "
+            "Set FMSG_ALLOWED_USERS explicitly for multiple senders.",
+            home,
+        )
+        return home
+    logger.error(
+        "[Fmsg] No FMSG_ALLOWED_USERS, FMSG_ALLOW_ALL_USERS, or FMSG_HOME_CHANNEL. "
+        "Inbound messages will be rejected as unauthorized. "
+        "Set FMSG_HOME_CHANNEL=@you@domain (and preferably FMSG_ALLOWED_USERS) "
+        "in ~/.hermes/.env, then restart the gateway."
+    )
+    return None
+
+
 def _env_enablement() -> Optional[dict]:
     """Seed PlatformConfig.extra from env so env-only setups auto-enable."""
     api_url = os.getenv("FMSG_API_URL", DEFAULT_API_URL).strip() or DEFAULT_API_URL
@@ -1418,6 +1466,8 @@ async def _standalone_send(
 
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system at startup."""
+    # Run before Hermes reads allowlist env for this process.
+    _seed_access_env()
     ctx.register_platform(
         name="fmsg",
         label="fmsg",
@@ -1425,7 +1475,12 @@ def register(ctx) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=is_connected,
-        required_env=["FMSG_API_URL", "FMSG_API_KEY"],
+        required_env=[
+            "FMSG_API_URL",
+            "FMSG_API_KEY",
+            "FMSG_HOME_CHANNEL",
+            "FMSG_ALLOWED_USERS",
+        ],
         install_hint="pip install httpx websockets",
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="FMSG_HOME_CHANNEL",
