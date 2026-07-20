@@ -166,6 +166,7 @@ Hermes Agent 0.18.x does not recognize an fmsg address as an explicit CLI
 target, so this form fails before the request reaches the plugin:
 
 ```bash
+# FAILS - DO NOT USE:
 hermes send --to 'fmsg:@alice@example.com' "whats up"
 ```
 
@@ -183,18 +184,6 @@ Install only this skill directly:
 
 ```bash
 hermes skills install markmnl/hermes-fmsg/skills/hermes-fmsg
-```
-
-Or add this repository as a community skill tap:
-
-```bash
-hermes skills tap add markmnl/hermes-fmsg
-```
-
-Maintainers can publish the reviewed skill to GitHub with:
-
-```bash
-hermes skills publish skills/hermes-fmsg --to github --repo markmnl/hermes-fmsg
 ```
 
 Users still need to install and configure the `fmsg-platform` plugin as shown
