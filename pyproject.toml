@@ -1,6 +1,6 @@
 [project]
 name = "hermes-fmsg"
-version = "0.2.0"
+version = "0.2.1"
 description = "fmsg messaging platform plugin for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11"

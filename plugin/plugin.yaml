@@ -1,7 +1,7 @@
 name: fmsg-platform
 label: fmsg
 kind: platform
-version: 0.2.0
+version: 0.2.1
 description: >
   fmsg platform adapter for Hermes Agent. Real-time inbound over the
   fmsg-webapi WebSocket (/fmsg/ws), outbound via its JSON REST routes.

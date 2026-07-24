@@ -44,7 +44,7 @@ hermes plugins install markmnl/hermes-fmsg --enable
 
 ## Status
 
-Developer preview (`v0.2.0`). The core message, attachment, reconnect, auth,
+Developer preview (`v0.2.1`). The core message, attachment, reconnect, auth,
 threading, and branching paths are implemented and unit tested. Install now
 prompts for home channel + allowlist, and seeds the allowlist from
 `FMSG_HOME_CHANNEL` when the allowlist is left empty. The plugin is a
