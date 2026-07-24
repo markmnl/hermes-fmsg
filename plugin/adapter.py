@@ -1248,6 +1248,18 @@ class FmsgAdapter(BasePlatformAdapter):
             )
         return await self._send_file(chat_id, image_url, caption, None, reply_to, metadata)
 
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Attach a local image file routed here by the Hermes gateway."""
+        return await self._send_file(chat_id, image_path, caption, None, reply_to, metadata)
+
     async def send_document(
         self,
         chat_id: str,
@@ -1366,7 +1378,7 @@ async def _standalone_send(
     message: str,
     *,
     thread_id: Optional[str] = None,
-    media_files: Optional[List[str]] = None,
+    media_files: Optional[List[Any]] = None,
     force_document: bool = False,
 ) -> Dict[str, Any]:
     """Out-of-process send for cron / send_message_tool when no live adapter."""
@@ -1439,8 +1451,13 @@ async def _standalone_send(
             pid=pid,
             topic=None if pid else topic,
         )
-        for media_path in media_files or []:
-            path = Path(media_path)
+        for media_entry in media_files or []:
+            # Gateway / send_message_tool may pass bare paths or (path, is_voice) tuples.
+            if isinstance(media_entry, (tuple, list)):
+                media_path = media_entry[0] if media_entry else ""
+            else:
+                media_path = media_entry
+            path = Path(str(media_path))
             try:
                 data = path.read_bytes()
             except OSError as e:

@@ -56,6 +56,25 @@ async def test_send_document_attaches_file(adapter, fake_api, tmp_path):
     assert fake_api.messages[msg_id]["_sent"] is True
 
 
+async def test_send_image_file_attaches_png(adapter, fake_api, tmp_path):
+    f = tmp_path / "image.png"
+    f.write_bytes(b"\x89PNG\r\nfake")
+    result = await adapter.send_image_file(USER, str(f), caption="cap")
+    assert result.success
+    msg_id = int(result.message_id)
+    assert fake_api.messages[msg_id]["_data"] == "cap"
+    assert fake_api.attachments[msg_id]["image.png"] == b"\x89PNG\r\nfake"
+    assert fake_api.messages[msg_id]["_sent"] is True
+
+
+async def test_send_image_local_path_still_works(adapter, fake_api, tmp_path):
+    f = tmp_path / "image.png"
+    f.write_bytes(b"\x89PNG\r\nfake")
+    result = await adapter.send_image(USER, str(f), caption="cap")
+    assert result.success
+    assert fake_api.attachments[int(result.message_id)]["image.png"] == b"\x89PNG\r\nfake"
+
+
 async def test_oversized_attachment_rejected(adapter, fake_api, tmp_path, monkeypatch):
     import plugin.adapter as adapter_mod
 
@@ -109,6 +128,50 @@ async def test_standalone_send(fake_api, monkeypatch):
     msg = fake_api.messages[int(result["message_id"])]
     assert msg["_sent"] is True
     assert msg["topic"] == "Hermes"
+
+
+async def test_standalone_send_with_media_tuple(fake_api, monkeypatch, tmp_path):
+    import plugin.adapter as adapter_mod
+    import plugin.fmsg_client as client_mod
+    import httpx
+
+    real_async_client = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = fake_api.transport()
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", patched)
+    f = tmp_path / "image.png"
+    f.write_bytes(b"\x89PNG\r\nfake")
+    pconfig = SimpleNamespace(extra={"api_url": "http://fmsg.test", "api_key": API_KEY})
+    result = await adapter_mod._standalone_send(
+        pconfig, USER, "cron image", media_files=[(str(f), False)]
+    )
+    assert result.get("success") is True
+    assert fake_api.attachments[int(result["message_id"])]["image.png"] == b"\x89PNG\r\nfake"
+
+
+async def test_standalone_send_with_media_bare_path(fake_api, monkeypatch, tmp_path):
+    import plugin.adapter as adapter_mod
+    import plugin.fmsg_client as client_mod
+    import httpx
+
+    real_async_client = httpx.AsyncClient
+
+    def patched(*args, **kwargs):
+        kwargs["transport"] = fake_api.transport()
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(client_mod.httpx, "AsyncClient", patched)
+    f = tmp_path / "image.png"
+    f.write_bytes(b"\x89PNG\r\nfake")
+    pconfig = SimpleNamespace(extra={"api_url": "http://fmsg.test", "api_key": API_KEY})
+    result = await adapter_mod._standalone_send(
+        pconfig, USER, "cron image", media_files=[str(f)]
+    )
+    assert result.get("success") is True
+    assert fake_api.attachments[int(result["message_id"])]["image.png"] == b"\x89PNG\r\nfake"
 
 
 async def test_standalone_send_missing_config(fake_api, monkeypatch):
