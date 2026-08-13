@@ -28,13 +28,9 @@ def main() -> None:
         # Import Hermes only after HERMES_HOME is isolated.  The env loader
         # must run before plugin discovery: this matches gateway startup.
         os.environ["HERMES_HOME"] = str(home)
-        from hermes_cli.config_defaults import DEFAULT_CONFIG
-
-        version = DEFAULT_CONFIG["_config_version"]
         (home / "config.yaml").write_text(
             "\n".join(
                 [
-                    f"_config_version: {version}",
                     "plugins:",
                     "  enabled:",
                     "    - fmsg-platform",
