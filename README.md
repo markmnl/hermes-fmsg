@@ -50,8 +50,9 @@ prompts for home channel + allowlist, and seeds the allowlist from
 `FMSG_HOME_CHANNEL` when the allowlist is left empty. The plugin is a
 standalone community integration, not bundled with Hermes Agent.
 
-Tested with Hermes Agent `v0.18.2`. Please report compatibility problems with
-your Hermes version and operating system.
+Supported and continuously tested with Hermes Agent `v0.19` and `v0.20`.
+Please report compatibility problems with your Hermes version and operating
+system.
 
 ## Quickstart
 
@@ -174,17 +175,6 @@ Use these integration paths:
 In all of these paths the plugin owns API-key exchange, sender identity,
 threading, attachments, and error handling. The Hermes agent should not read
 `FMSG_API_KEY`, manage JWTs, or construct fmsg drafts itself.
-
-Hermes Agent 0.18.x does not recognize an fmsg address as an explicit CLI
-target, so this form fails before the request reaches the plugin:
-
-```bash
-hermes send --to 'fmsg:@alice@example.com' "whats up"
-```
-
-This is only a `hermes send --to` target-resolution limitation: the request
-fails before the fmsg adapter is called. Replies, home-channel sends, and
-direct calls to the platform adapter are unaffected.
 
 ## How conversations map to Hermes
 
