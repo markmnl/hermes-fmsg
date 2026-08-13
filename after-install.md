@@ -8,12 +8,12 @@
 3. `FMSG_ALLOWED_USERS=@you@domain` — who may talk to the agent  
    If you leave `FMSG_ALLOWED_USERS` empty but set `FMSG_HOME_CHANNEL`, the
    plugin defaults the allowlist to the home channel at gateway start.
-4. Start the gateway and confirm fmsg is connected:
+4. Start the gateway and confirm `fmsg connected` is logged:
 
 ```bash
 hermes gateway restart
 hermes gateway status
-# gateway log should include: fmsg connected
+# gateway log should include: fmsg connected — streaming from …
 ```
 
 ## Common footguns

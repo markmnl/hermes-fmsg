@@ -370,7 +370,9 @@ class FmsgAdapter(BasePlatformAdapter):
         self._load_state()
         self._ws_task = asyncio.create_task(self._run_ws())
         self._mark_connected()
-        logger.info("[%s] Connected — streaming from %s/fmsg/ws", self.name, self._api_url)
+        # Keep this marker stable: deployment scripts and operators use it as
+        # the positive health signal after starting an unattended gateway.
+        logger.info("[%s] fmsg connected — streaming from %s/fmsg/ws", self.name, self._api_url)
         return True
 
     async def disconnect(self) -> None:

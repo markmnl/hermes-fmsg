@@ -26,15 +26,24 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest -q
 
-  hermes-main-contract:
-    name: Hermes main contract
+  hermes-contract:
+    name: Hermes ${{ matrix.name }} contract
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: v0.19
+            ref: v2026.7.20
+          - name: v0.20
+            ref: v2026.8.3
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           repository: NousResearch/hermes-agent
           path: hermes-agent
+          ref: ${{ matrix.ref }}
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
@@ -42,3 +51,4 @@ jobs:
       - run: python -m pip install -e ./hermes-agent
       - run: python -m pip install httpx websockets
       - run: PYTHONPATH=hermes-agent python scripts/check_hermes_contract.py
+      - run: PYTHONPATH=hermes-agent python scripts/check_hermes_activation.py

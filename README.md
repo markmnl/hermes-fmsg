@@ -139,7 +139,7 @@ hermes plugins list --plain --no-bundled
 ```
 
 The plugin list should show `fmsg-platform` enabled and the gateway log should
-show `fmsg connected`. Send a message to the agent's address to open its first
+show `fmsg connected — streaming from …`. Send a message to the agent's address to open its first
 Hermes session.
 
 ### Sending messages from Hermes
