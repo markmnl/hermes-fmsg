@@ -50,7 +50,7 @@ prompts for home channel + allowlist, and seeds the allowlist from
 `FMSG_HOME_CHANNEL` when the allowlist is left empty. The plugin is a
 standalone community integration, not bundled with Hermes Agent.
 
-Supported and continuously tested with Hermes Agent `v0.19` and `v0.20`.
+Supported and continuously tested with Hermes Agent `v0.19` through `v0.21`.
 Please report compatibility problems with your Hermes version and operating
 system.
 
