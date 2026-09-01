@@ -1355,6 +1355,69 @@ def _seed_access_env() -> Optional[str]:
     return None
 
 
+# fmsg has no message-edit API (see plugin/adapter.py's _send_message /
+# lack of any edit_message method), so every gateway progress heartbeat
+# ("⏳ Working — N min", tool-progress bubbles, busy-ack iteration detail)
+# becomes a permanent, separate fmsg message instead of an in-place edit.
+# Hermes core's display_config.py has no built-in tier for "fmsg" (it is a
+# third-party plugin platform, unknown to hermes-agent's _PLATFORM_DEFAULTS),
+# so it silently falls through to the noisiest _GLOBAL_DEFAULTS tier. Track
+# this upstream at https://github.com/NousResearch/hermes-agent — until a
+# built-in "fmsg" tier lands there, seed the same quiet settings Signal/
+# WhatsApp Cloud/Photon use (_TIER_LOW: no edit support) directly into the
+# user's config.yaml on first install, mirroring _seed_access_env()'s
+# environment-seeding pattern.
+_QUIET_DISPLAY_DEFAULTS: Dict[str, Any] = {
+    "tool_progress": "off",
+    "busy_ack_detail": False,
+    "long_running_notifications": False,
+    "interim_assistant_messages": False,
+}
+
+
+def _seed_display_config() -> bool:
+    """First-run safety so fmsg threads aren't flooded with progress noise.
+
+    No-op if the user has already configured anything under
+    ``display.platforms.fmsg`` (any key at all — partial user config is
+    respected as-is, we never overwrite an explicit choice). Best-effort:
+    any failure to load/save config.yaml is logged and swallowed so a
+    broken config never blocks plugin registration.
+
+    Returns True when defaults were written, else False.
+    """
+    try:
+        from hermes_cli.config import load_config, save_config
+    except Exception as e:
+        logger.debug("[Fmsg] display-config seeding unavailable: %s", e)
+        return False
+    try:
+        cfg = load_config()
+        display_cfg = cfg.get("display")
+        if not isinstance(display_cfg, dict):
+            display_cfg = {}
+            cfg["display"] = display_cfg
+        platforms_cfg = display_cfg.get("platforms")
+        if not isinstance(platforms_cfg, dict):
+            platforms_cfg = {}
+            display_cfg["platforms"] = platforms_cfg
+        if "fmsg" in platforms_cfg:
+            # User (or a previous seed) already has an opinion — leave it.
+            return False
+        platforms_cfg["fmsg"] = dict(_QUIET_DISPLAY_DEFAULTS)
+        save_config(cfg)
+        logger.info(
+            "[Fmsg] Seeded display.platforms.fmsg with quiet defaults "
+            "(no message-edit support means progress heartbeats would "
+            "otherwise post as permanent fmsg messages). Override in "
+            "~/.hermes/config.yaml if you want verbose progress detail."
+        )
+        return True
+    except Exception as e:
+        logger.warning("[Fmsg] Failed to seed display.platforms.fmsg: %s", e)
+        return False
+
+
 def _env_enablement() -> Optional[dict]:
     """Seed PlatformConfig.extra from env so env-only setups auto-enable."""
     api_url = os.getenv("FMSG_API_URL", DEFAULT_API_URL).strip() or DEFAULT_API_URL
@@ -1487,6 +1550,7 @@ def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system at startup."""
     # Run before Hermes reads allowlist env for this process.
     _seed_access_env()
+    _seed_display_config()
     ctx.register_platform(
         name="fmsg",
         label="fmsg",
