@@ -51,6 +51,21 @@ def main() -> None:
         raise RuntimeError(f"register_platform contract missing: {', '.join(missing)}")
     if platform["name"] != "fmsg":
         raise RuntimeError(f"unexpected platform name: {platform['name']!r}")
+
+    # Newer optional hooks must be used whenever this Hermes supports them.
+    import dataclasses
+    from gateway.platform_registry import PlatformEntry
+
+    supported = {f.name for f in dataclasses.fields(PlatformEntry)}
+    for hook in ("parse_target_ref_fn", "display_tier"):
+        if hook in supported and hook not in platform:
+            raise RuntimeError(f"Hermes supports {hook} but the plugin did not pass it")
+    if "parse_target_ref_fn" in platform:
+        parsed = platform["parse_target_ref_fn"]("@alice@example.com")
+        if parsed != ("@alice@example.com", None):
+            raise RuntimeError(f"unexpected parsed target: {parsed!r}")
+    # Building the real entry catches kwargs this Hermes does not accept.
+    PlatformEntry(**platform)
     print("Hermes platform contract OK")
 
 

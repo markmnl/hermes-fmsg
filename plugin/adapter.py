@@ -76,10 +76,12 @@ best-effort fallback to avoid losing the agent's output.
 """
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
 import random
+import re
 import time
 import mimetypes
 from datetime import datetime, timezone
@@ -155,8 +157,35 @@ _KIND_TO_MESSAGE_TYPE = {
 }
 
 
+def _env(name: str, default: str = "") -> str:
+    """Read a FMSG_* setting for the active Hermes profile.
+
+    Hermes v0.21.1+ can run several profiles in one gateway process; each
+    profile's ``.env`` is only visible through ``get_scoped_secret``, while
+    ``os.environ`` holds the default profile's values. Older Hermes has no
+    scoped reader, so fall back to the process environment.
+    """
+    try:
+        from gateway.platforms._shared import get_scoped_secret
+    except Exception:
+        value = os.getenv(name)
+    else:
+        value = get_scoped_secret(name, None)
+    return default if value is None else str(value)
+
+
+def _hermes_home() -> Path:
+    """The active profile's Hermes home (per profile when multiplexed)."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes")))
+
+
 def _extra_or_env(extra: Dict[str, Any], key: str, env: str, default: str = "") -> str:
-    return str(extra.get(key) or os.getenv(env, default) or default).strip()
+    return str(extra.get(key) or _env(env, default) or default).strip()
 
 
 def _norm_addr(addr: str) -> str:
@@ -289,19 +318,50 @@ def _truthy_meta_false(value: Any) -> bool:
     return False
 
 
+# An fmsg address: "@user@domain" with no whitespace or extra "@".
+_FMSG_ADDRESS_RE = re.compile(r"@[^@\s]+@[^@\s]+")
+
+
+def parse_target_ref(target_ref: str) -> Optional[Tuple[str, Optional[str]]]:
+    """Parse the part after ``fmsg:`` in an explicit Hermes send target.
+
+    ``fmsg:@alice@example.com`` -> ``("@alice@example.com", None)``. Anything
+    else returns None so Hermes falls back to channel-directory names.
+    """
+    address = (target_ref or "").strip()
+    if _FMSG_ADDRESS_RE.fullmatch(address):
+        return address, None
+    return None
+
+
+def _supported_entry_kwargs(**kwargs: Any) -> Dict[str, Any]:
+    """Keep only kwargs the installed Hermes ``PlatformEntry`` accepts.
+
+    Older Hermes versions raise TypeError on unknown ``register_platform``
+    kwargs, so newer hooks are passed only when the field exists.
+    """
+    try:
+        from gateway.platform_registry import PlatformEntry
+
+        names = {f.name for f in dataclasses.fields(PlatformEntry)}
+    except Exception:
+        return {}
+    return {k: v for k, v in kwargs.items() if k in names}
+
+
 def check_requirements() -> bool:
     """Installable and minimally configured (deps + required env)."""
     if not (HTTPX_AVAILABLE and WEBSOCKETS_AVAILABLE):
         return False
-    return bool(os.getenv("FMSG_API_KEY", "").strip())
+    return bool(_env("FMSG_API_KEY", "").strip())
 
 
 def validate_config(config) -> bool:
     extra = getattr(config, "extra", {}) or {}
     api_url = (
-        extra.get("api_url") or os.getenv("FMSG_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+        extra.get("api_url") or _env("FMSG_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
     )
-    api_key = extra.get("api_key") or os.getenv("FMSG_API_KEY", "")
+    api_key = extra.get("api_key") or _env("FMSG_API_KEY", "")
     return bool(api_url and api_key)
 
 
@@ -349,9 +409,7 @@ class FmsgAdapter(BasePlatformAdapter):
         # message id -> Hermes thread_id / branch key for that message.
         self._msg_branch: Dict[int, str] = {}
         self._last_seen_id: int = 0
-        self._state_path = Path(
-            os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))
-        ) / "fmsg_last_seen.json"
+        self._state_path = _hermes_home() / "fmsg_last_seen.json"
 
     # -- Connection lifecycle -------------------------------------------------
 
@@ -1311,7 +1369,7 @@ class FmsgAdapter(BasePlatformAdapter):
 
 
 def _allow_all_enabled() -> bool:
-    return (os.getenv("FMSG_ALLOW_ALL_USERS") or "").strip().lower() in {
+    return (_env("FMSG_ALLOW_ALL_USERS") or "").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -1334,10 +1392,10 @@ def _seed_access_env() -> Optional[str]:
 
     Returns the seeded allowlist value when seeding occurs, else ``None``.
     """
-    allowed = (os.getenv("FMSG_ALLOWED_USERS") or "").strip()
+    allowed = (_env("FMSG_ALLOWED_USERS") or "").strip()
     if allowed or _allow_all_enabled():
         return None
-    home = (os.getenv("FMSG_HOME_CHANNEL") or "").strip()
+    home = (_env("FMSG_HOME_CHANNEL") or "").strip()
     if home:
         os.environ["FMSG_ALLOWED_USERS"] = home
         logger.warning(
@@ -1359,14 +1417,10 @@ def _seed_access_env() -> Optional[str]:
 # lack of any edit_message method), so every gateway progress heartbeat
 # ("⏳ Working — N min", tool-progress bubbles, busy-ack iteration detail)
 # becomes a permanent, separate fmsg message instead of an in-place edit.
-# Hermes core's display_config.py has no built-in tier for "fmsg" (it is a
-# third-party plugin platform, unknown to hermes-agent's _PLATFORM_DEFAULTS),
-# so it silently falls through to the noisiest _GLOBAL_DEFAULTS tier. Track
-# this upstream at https://github.com/NousResearch/hermes-agent — until a
-# built-in "fmsg" tier lands there, seed the same quiet settings Signal/
-# WhatsApp Cloud/Photon use (_TIER_LOW: no edit support) directly into the
-# user's config.yaml on first install, mirroring _seed_access_env()'s
-# environment-seeding pattern.
+# Hermes v0.21.6+ fixes this through ``display_tier="low"`` at registration
+# (the tier Signal / WhatsApp Cloud use). Older Hermes has no tier for a
+# plugin platform and falls through to the noisiest global defaults, so
+# there register() instead seeds these quiet settings into config.yaml.
 _QUIET_DISPLAY_DEFAULTS: Dict[str, Any] = {
     "tool_progress": "off",
     "busy_ack_detail": False,
@@ -1420,19 +1474,19 @@ def _seed_display_config() -> bool:
 
 def _env_enablement() -> Optional[dict]:
     """Seed PlatformConfig.extra from env so env-only setups auto-enable."""
-    api_url = os.getenv("FMSG_API_URL", DEFAULT_API_URL).strip() or DEFAULT_API_URL
-    api_key = os.getenv("FMSG_API_KEY", "").strip()
+    api_url = _env("FMSG_API_URL", DEFAULT_API_URL).strip() or DEFAULT_API_URL
+    api_key = _env("FMSG_API_KEY", "").strip()
     if not api_key:
         return None
     seed: dict = {"api_url": api_url.rstrip("/"), "api_key": api_key}
-    default_topic = os.getenv("FMSG_DEFAULT_TOPIC", "").strip()
+    default_topic = _env("FMSG_DEFAULT_TOPIC", "").strip()
     if default_topic:
         seed["default_topic"] = default_topic
-    home = os.getenv("FMSG_HOME_CHANNEL", "").strip()
+    home = _env("FMSG_HOME_CHANNEL", "").strip()
     if home:
         seed["home_channel"] = {
             "chat_id": home,
-            "name": os.getenv("FMSG_HOME_CHANNEL_NAME", "").strip() or home,
+            "name": _env("FMSG_HOME_CHANNEL_NAME", "").strip() or home,
         }
     return seed
 
@@ -1451,9 +1505,9 @@ async def _standalone_send(
         return {"error": "fmsg standalone send: httpx not installed"}
     extra = getattr(pconfig, "extra", {}) or {}
     api_url = (
-        extra.get("api_url") or os.getenv("FMSG_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
+        extra.get("api_url") or _env("FMSG_API_URL", DEFAULT_API_URL) or DEFAULT_API_URL
     ).strip().rstrip("/")
-    api_key = (extra.get("api_key") or os.getenv("FMSG_API_KEY", "")).strip()
+    api_key = (extra.get("api_key") or _env("FMSG_API_KEY", "")).strip()
     if not api_key:
         return {"error": "fmsg standalone send: FMSG_API_KEY not configured"}
     if not chat_id:
@@ -1461,7 +1515,7 @@ async def _standalone_send(
 
     topic = (
         extra.get("default_topic")
-        or os.getenv("FMSG_DEFAULT_TOPIC", "").strip()
+        or _env("FMSG_DEFAULT_TOPIC", "").strip()
         or DEFAULT_TOPIC
     )
     client = FmsgClient(TokenManager(api_url, api_key))
@@ -1550,7 +1604,26 @@ def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system at startup."""
     # Run before Hermes reads allowlist env for this process.
     _seed_access_env()
-    _seed_display_config()
+    optional_hooks = _supported_entry_kwargs(
+        # v0.20.1+: explicit targets such as ``fmsg:@alice@example.com``.
+        parse_target_ref_fn=parse_target_ref,
+        # v0.21.6+: built-in quiet display defaults for platforms that
+        # cannot edit messages (same as Signal / WhatsApp Cloud).
+        display_tier="low",
+    )
+    if "display_tier" not in optional_hooks:
+        # Older Hermes: write the same quiet defaults into config.yaml.
+        _seed_display_config()
+    if "parse_target_ref_fn" in optional_hooks:
+        send_hint = (
+            "Other fmsg addresses use the target form `fmsg:@alice@example.com`. "
+        )
+    else:
+        send_hint = (
+            "This Hermes version cannot parse an arbitrary fmsg address such as "
+            "fmsg:@alice@example.com as an explicit send target. Report that routing "
+            "limitation instead of bypassing the adapter. "
+        )
     ctx.register_platform(
         name="fmsg",
         label="fmsg",
@@ -1586,12 +1659,11 @@ def register(ctx) -> None:
             "sender address comes from the API key's exchanged JWT; never ask for "
             "or invent a separate from address. Reply normally in the current "
             "conversation; Hermes will preserve its fmsg thread and recipients. "
-            "To send to the configured home address, use the send_message tool with "
-            "target `fmsg`. Do not call the fmsg Web API, read FMSG_API_KEY, construct "
+            "If a send_message tool is available, target `fmsg` reaches the configured "
+            "home address. Do not call the fmsg Web API, read FMSG_API_KEY, construct "
             "drafts, or manage JWTs yourself; the platform adapter owns those tasks. "
-            "Hermes Agent 0.18.x cannot parse an arbitrary fmsg address such as "
-            "fmsg:@alice@example.com as an explicit send target. Report that routing "
-            "limitation instead of bypassing the adapter. Deliver files through "
-            "Hermes's normal attachment mechanism."
+            + send_hint
+            + "Deliver files through Hermes's normal attachment mechanism."
         ),
+        **optional_hooks,
     )
