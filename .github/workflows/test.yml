@@ -37,6 +37,10 @@ jobs:
             ref: v2026.7.20
           - name: v0.20
             ref: v2026.8.3
+          - name: v0.21
+            ref: v2026.8.31
+          - name: v0.22
+            ref: v0.22.2
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

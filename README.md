@@ -44,13 +44,16 @@ hermes plugins install markmnl/hermes-fmsg --enable
 
 ## Status
 
-`v0.2.3` The core message, attachment, reconnect, auth,
+`v0.2.4` The core message, attachment, reconnect, auth,
 threading, and branching paths are implemented and unit tested. Install now
 prompts for home channel + allowlist, and seeds the allowlist from
 `FMSG_HOME_CHANNEL` when the allowlist is left empty. The plugin is a
 standalone community integration, not bundled with Hermes Agent.
 
-Supported and continuously tested with Hermes Agent `v0.19` through `v0.21`.
+Supported and continuously tested with Hermes Agent `v0.19` through `v0.22`.
+The plugin uses newer Hermes features when they are available: explicit
+`fmsg:@user@domain` send targets (`v0.20.1`+), per-profile settings in a
+shared gateway (`v0.21.1`+), and built-in quiet progress display (`v0.21.6`+).
 Please report compatibility problems with your Hermes version and operating
 system.
 
@@ -156,6 +159,16 @@ address using the platform-only target:
 hermes send --to fmsg "whats up"
 ```
 
+On Hermes Agent `v0.20.1` and later, you can also send to any fmsg address
+by putting it after the `fmsg:` prefix:
+
+```bash
+hermes send --to 'fmsg:@alice@example.com' "whats up"
+```
+
+Older Hermes versions reject that form
+([hermes-agent#67941](https://github.com/NousResearch/hermes-agent/issues/67941)).
+
 Replies in an existing fmsg conversation automatically use that
 conversation's address and thread. Code calling the plugin sender directly
 must pass the recipient's complete fmsg address, such as
@@ -165,8 +178,11 @@ Use these integration paths:
 
 - **Current conversation:** reply normally; the live adapter preserves the
   fmsg parent, recipients, and Hermes session.
-- **Configured home channel:** use `hermes send --to fmsg "message"` or the
-  Hermes `send_message` tool with target `fmsg`.
+- **Configured home channel:** use `hermes send --to fmsg "message"`. On
+  Hermes before `v0.21.1`, the agent can also use the `send_message` tool with
+  target `fmsg`; later versions removed that tool from the agent.
+- **Any fmsg address (Hermes `v0.20.1`+):** use target
+  `fmsg:@alice@example.com`.
 - **Cron delivery:** configure `FMSG_HOME_CHANNEL`; Hermes invokes the plugin's
   registered standalone sender when it is outside the gateway process.
 - **Application code inside Hermes:** call the platform adapter's `send` method
